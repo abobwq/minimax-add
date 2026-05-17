@@ -231,50 +231,33 @@ def component_mask_with_pos(grid, pos_a):
 
 
 @jax.jit
-def _bfs_shortest_path(wall_map, pos_a, pos_b):
-	"""BFS shortest path via wavefront relaxation.
+def shortest_path_len(grid, pos_a, pos_b):
+	grid = ~component_mask_with_pos(grid, pos_a)
 
-	Positions are (x, y) = (col, row). wall_map[row, col] = True means wall.
-	Returns the hop count, or 0 if pos_b is unreachable from pos_a.
+	A = grid_to_graph(grid)
+	D = apsp(A, n=A.shape[0])
 
-	Each of the n = h*w scan iterations propagates the BFS frontier one step,
-	so the result is exact for any connected component in an h×w grid.
-	"""
-	h, w = wall_map.shape
-	n = h * w
-	INF = n + 1
-
-	walls = wall_map.flatten()
-	a_idx = pos_a[1] * w + pos_a[0]
-	b_idx = pos_b[1] * w + pos_b[0]
-
-	dist = jnp.full(n, INF, dtype=jnp.int32)
-	dist = dist.at[a_idx].set(0)
-
-	def _relax(dist, _):
-		d2 = dist.reshape(h, w)
-		neighbor_min = jnp.minimum(
-			jnp.minimum(
-				jnp.pad(d2[:, :-1], ((0, 0), (1, 0)), constant_values=INF),
-				jnp.pad(d2[:, 1:],  ((0, 0), (0, 1)), constant_values=INF),
-			),
-			jnp.minimum(
-				jnp.pad(d2[:-1, :], ((1, 0), (0, 0)), constant_values=INF),
-				jnp.pad(d2[1:,  :], ((0, 1), (0, 0)), constant_values=INF),
-			),
+	if len(pos_b.shape) == 2: # batch eval
+		return jax.vmap(_shortest_path_len, in_axes=(None, None, 0, None))(
+			grid, pos_a, pos_b, D
 		)
-		new_dist = jnp.minimum(d2, neighbor_min + 1).flatten()
-		return jnp.where(walls, INF, new_dist), None
-
-	dist, _ = jax.lax.scan(_relax, dist, None, length=n)
-
-	d = dist[b_idx]
-	return jnp.where(d >= INF, jnp.int32(0), d)
+	else:
+		return _shortest_path_len(grid, pos_a, pos_b, D)
 
 
 @jax.jit
-def shortest_path_len(wall_map, pos_a, pos_b):
-	if len(pos_b.shape) == 2:  # batch eval
-		return jax.vmap(lambda pb: _bfs_shortest_path(wall_map, pos_a, pb))(pos_b)
-	else:
-		return _bfs_shortest_path(wall_map, pos_a, pos_b)
+def _shortest_path_len(grid, pos_a, pos_b, D):
+	h,w = grid.shape
+
+	a_idx = pos_a[1]*w + pos_a[0]
+	b_idx = pos_b[1]*w + pos_b[0]
+	d = D[a_idx][b_idx]
+
+	mhttn_d = jnp.sum(jnp.abs(jnp.maximum(pos_a,pos_b)- jnp.minimum(pos_a,pos_b)))
+
+	impossible = jnp.logical_and(
+		d == 1,
+		mhttn_d > 1
+	)
+
+	return d*(1-impossible)
