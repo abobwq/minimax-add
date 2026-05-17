@@ -419,13 +419,9 @@ class PAIREDRunner:
 		stats.update(teacher_stats)
 
 		if self.track_env_metrics:
-			for k,v in env_metrics.items():
-				if 'shortest_path' in k:
-					env_metrics.update({k:jnp.max(v)})  # Track max shortest path length
-
 			passable_mask = env_metrics.pop('passable')
 			mean_env_metrics = jax.tree_util.tree_map(
-				lambda x: (x*passable_mask).sum()/passable_mask.sum(), 
+				lambda x: (x*passable_mask).sum()/passable_mask.sum(),
 				env_metrics
 			)
 			mean_env_metrics.update({'passable_ratio': passable_mask.mean()})

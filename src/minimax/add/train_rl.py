@@ -51,14 +51,14 @@ def make_runner(args):
         see_through_walls=True,
         agent_view_size=5,
         max_episode_steps=250,
-        normalize_obs=False,
+        normalize_obs=True,
         sample_n_walls=True,
         replace_wall_pos=True,
     )
 
-    # PLR uses fixed wall count and normalized obs (paper config).
+    # PLR uses a fixed wall count so the level buffer can track specific levels.
     if args.runner == "plr":
-        env_kwargs.update(normalize_obs=True, sample_n_walls=False)
+        env_kwargs.update(sample_n_walls=False)
 
     dummy_env, _ = envs.make("Maze", env_kwargs=env_kwargs)
     n_actions = dummy_env.action_space().n
@@ -188,7 +188,7 @@ def make_runner(args):
     eval_runner = EvalRunner(
         pop=runner.student_pop,
         env_names=EVAL_ENV_NAMES,
-        env_kwargs={},
+        env_kwargs={"normalize_obs": True},
         n_episodes=args.eval_episodes,
     )
 
@@ -308,7 +308,7 @@ def main():
 
             solved_rates = {}
             for k, v in eval_stats.items():
-                if "solved_rate" in k:
+                if "solved_rate" in k and "/a0:" in k:  # protagonist only; safe for n_students=1
                     env_name = k.split(":")[-1]
                     solved_rates[env_name] = float(v)
 
