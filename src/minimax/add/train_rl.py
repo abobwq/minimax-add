@@ -19,6 +19,8 @@ import minimax.envs as envs
 import minimax.models as models
 import minimax.agents as agents
 from minimax.runners.dr_runner import DRRunner
+from minimax.runners.paired_runner import PAIREDRunner
+from minimax.runners.plr_runner import PLRRunner
 from minimax.runners.eval_runner import EvalRunner
 from minimax.util.rl import AgentPop
 
@@ -53,6 +55,10 @@ def make_runner(args):
         sample_n_walls=True,
         replace_wall_pos=True,
     )
+
+    # PLR uses fixed wall count and normalized obs (paper config).
+    if args.runner == "plr":
+        env_kwargs.update(normalize_obs=True, sample_n_walls=False)
 
     dummy_env, _ = envs.make("Maze", env_kwargs=env_kwargs)
     n_actions = dummy_env.action_space().n
@@ -103,6 +109,79 @@ def make_runner(args):
         )
     elif args.runner == "dr":
         runner = DRRunner(**runner_kwargs)
+    elif args.runner == "paired":
+        # Teacher MDP kwargs — fixed constants from the PAIRED paper config.
+        # n_walls follows --n_walls so student and teacher environments are consistent.
+        ued_env_kwargs = dict(
+            height=13,
+            width=13,
+            n_walls=args.n_walls,
+            noise_dim=50,
+            replace_wall_pos=True,
+            fixed_n_wall_steps=True,
+            first_wall_pos_sets_budget=False,
+            set_agent_dir=False,
+            normalize_obs=True,
+        )
+
+        # Instantiate UED env just to query teacher action/obs space dimensions.
+        ued_env, _, _ = envs.make("Maze", env_kwargs=env_kwargs, ued_env_kwargs=ued_env_kwargs)
+        max_teacher_steps = ued_env.ued_max_episode_steps()
+
+        teacher_model = models.make(
+            env_name="Maze",
+            model_name="default_teacher_cnn",
+            output_dim=ued_env.ued_action_space().n,
+            recurrent_arch="lstm",
+            recurrent_hidden_dim=256,
+            hidden_dim=32,
+            n_hidden_layers=1,
+            n_conv_filters=128,
+            n_scalar_embeddings=max_teacher_steps,
+            max_scalar=max_teacher_steps,
+            scalar_embed_dim=10,
+        )
+
+        teacher_agent = agents.PPOAgent(
+            model=teacher_model,
+            n_epochs=args.ppo_epochs,
+            n_minibatches=args.ppo_minibatches,
+            clip_eps=args.ppo_clip,
+            entropy_coef=args.teacher_entropy_coef,
+        )
+
+        runner = PAIREDRunner(
+            env_name="Maze",
+            env_kwargs=env_kwargs,
+            ued_env_kwargs=ued_env_kwargs,
+            student_agents=[student_agent],
+            teacher_agents=[teacher_agent],
+            n_students=2,
+            n_parallel=args.n_parallel,
+            n_eval=1,
+            n_rollout_steps=args.rollout_steps,
+            lr=args.lr,
+            discount=args.discount,
+            gae_lambda=args.gae_lambda,
+            teacher_discount=args.teacher_discount,
+            teacher_gae_lambda=args.teacher_gae_lambda,
+            ued_score=args.ued_score,
+            track_env_metrics=True,
+        )
+    elif args.runner == "plr":
+        runner = PLRRunner(
+            replay_prob=args.plr_replay_prob,
+            buffer_size=args.plr_buffer_size,
+            staleness_coef=args.plr_staleness_coef,
+            temp=args.plr_temp,
+            use_score_ranks=args.plr_use_score_ranks,
+            min_fill_ratio=args.plr_min_fill_ratio,
+            use_robust_plr=args.plr_use_robust_plr,
+            use_parallel_eval=args.plr_use_parallel_eval,
+            ued_score=args.plr_ued_score,
+            force_unique=args.plr_force_unique,
+            **runner_kwargs,
+        )
     else:
         raise ValueError(f"Unknown runner: {args.runner}")
 
@@ -118,7 +197,7 @@ def make_runner(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Train RL agent (Stage 2)")
-    parser.add_argument("--runner", type=str, default="add", choices=["add", "dr"])
+    parser.add_argument("--runner", type=str, default="add", choices=["add", "dr", "paired", "plr"])
     parser.add_argument("--diffusion_ckpt", type=str, default="checkpoints/diffusion/final.pkl")
     parser.add_argument("--ddim_steps", type=int, default=50)
     parser.add_argument("--unet_attn_res", type=int, nargs="+", default=None,
@@ -141,6 +220,24 @@ def main():
     parser.add_argument("--ppo_minibatches", type=int, default=1)
     parser.add_argument("--ppo_clip", type=float, default=0.2)
     parser.add_argument("--entropy_coef", type=float, default=0.0)
+
+    # PLR-specific hyperparameters (ignored for other runners)
+    parser.add_argument("--plr_ued_score", type=str, default="max_mc")
+    parser.add_argument("--plr_replay_prob", type=float, default=0.5)
+    parser.add_argument("--plr_buffer_size", type=int, default=4000)
+    parser.add_argument("--plr_staleness_coef", type=float, default=0.5)
+    parser.add_argument("--plr_temp", type=float, default=0.3)
+    parser.add_argument("--plr_min_fill_ratio", type=float, default=0.5)
+    parser.add_argument("--plr_use_score_ranks", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--plr_use_robust_plr", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--plr_use_parallel_eval", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--plr_force_unique", action=argparse.BooleanOptionalAction, default=True)
+
+    # PAIRED-specific hyperparameters (ignored for other runners)
+    parser.add_argument("--teacher_entropy_coef", type=float, default=0.05)
+    parser.add_argument("--teacher_gae_lambda", type=float, default=0.98)
+    parser.add_argument("--teacher_discount", type=float, default=0.995)
+    parser.add_argument("--ued_score", type=str, default="relative_regret")
 
     parser.add_argument("--n_updates", type=int, default=30000)
     parser.add_argument("--log_every", type=int, default=10)
@@ -190,7 +287,12 @@ def main():
         if tick % args.log_every == 0:
             elapsed = time.time() - t0
             sps = train_steps / elapsed
-            mean_return = float(stats.get("return", 0.0))
+            # DR/ADD: stats has "return"; PAIRED: stats has "mean_return_a0", "mean_return_a1"
+            if "return" in stats:
+                mean_return = float(stats["return"])
+            else:
+                student_returns = [float(v) for k, v in stats.items() if k.startswith("mean_return_a")]
+                mean_return = float(np.mean(student_returns)) if student_returns else 0.0
             print(
                 f"update {tick:>6d}/{args.n_updates} | "
                 f"steps {train_steps:>10,} | "
@@ -230,9 +332,12 @@ def main():
 
         if tick % args.ckpt_every == 0 or tick == args.n_updates:
             ckpt_path = os.path.join(ckpt_dir, f"step_{tick:06d}.pkl")
-            params_cpu = jax.device_get(runner_state[1].params)
+            ckpt = {"params": jax.device_get(runner_state[1].params), "step": tick}
+            if args.runner == "paired":
+                # runner_state[6] is ued_train_state (teacher)
+                ckpt["teacher_params"] = jax.device_get(runner_state[6].params)
             with open(ckpt_path, "wb") as f:
-                pickle.dump({"params": params_cpu, "step": tick}, f)
+                pickle.dump(ckpt, f)
             print(f"  checkpoint saved: {ckpt_path}")
 
     total_time = time.time() - t0
