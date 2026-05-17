@@ -56,7 +56,9 @@ def make_runner(args):
         replace_wall_pos=True,
     )
 
-    if args.runner == "dr":
+    if args.sample_n_walls is not None:
+        env_kwargs.update(sample_n_walls=args.sample_n_walls)
+    elif args.runner in ("dr", "accel"):
         env_kwargs.update(sample_n_walls=False)
 
     dummy_env, _ = envs.make("Maze", env_kwargs=env_kwargs)
@@ -167,7 +169,7 @@ def make_runner(args):
             ued_score=args.ued_score,
             track_env_metrics=True,
         )
-    elif args.runner == "plr":
+    elif args.runner in ("plr", "accel"):
         runner = PLRRunner(
             replay_prob=args.plr_replay_prob,
             buffer_size=args.plr_buffer_size,
@@ -179,6 +181,10 @@ def make_runner(args):
             use_parallel_eval=args.plr_use_parallel_eval,
             ued_score=args.plr_ued_score,
             force_unique=args.plr_force_unique,
+            mutation_fn=args.plr_mutation_fn,
+            n_mutations=args.plr_n_mutations,
+            mutation_criterion=args.plr_mutation_criterion,
+            mutation_subsample_size=args.plr_mutation_subsample_size,
             **runner_kwargs,
         )
     else:
@@ -196,7 +202,7 @@ def make_runner(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Train RL agent (Stage 2)")
-    parser.add_argument("--runner", type=str, default="add", choices=["add", "dr", "paired", "plr"])
+    parser.add_argument("--runner", type=str, default="add", choices=["add", "dr", "paired", "plr", "accel"])
     parser.add_argument("--diffusion_ckpt", type=str, default="checkpoints/diffusion/final.pkl")
     parser.add_argument("--ddim_steps", type=int, default=50)
     parser.add_argument("--unet_attn_res", type=int, nargs="+", default=None,
@@ -210,6 +216,8 @@ def main():
                              "needed by v1/v2/v3 checkpoints.")
 
     parser.add_argument("--n_walls", type=int, default=25)
+    parser.add_argument("--sample_n_walls", action=argparse.BooleanOptionalAction, default=None,
+                        help="Override sample_n_walls. Default: False for dr/accel, True for plr.")
     parser.add_argument("--n_parallel", type=int, default=32)
     parser.add_argument("--rollout_steps", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -220,7 +228,7 @@ def main():
     parser.add_argument("--ppo_clip", type=float, default=0.2)
     parser.add_argument("--entropy_coef", type=float, default=0.0)
 
-    # PLR-specific hyperparameters (ignored for other runners)
+    # PLR/ACCEL-specific hyperparameters (ignored for other runners)
     parser.add_argument("--plr_ued_score", type=str, default="max_mc")
     parser.add_argument("--plr_replay_prob", type=float, default=0.5)
     parser.add_argument("--plr_buffer_size", type=int, default=4000)
@@ -231,6 +239,11 @@ def main():
     parser.add_argument("--plr_use_robust_plr", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--plr_use_parallel_eval", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--plr_force_unique", action=argparse.BooleanOptionalAction, default=True)
+    # ACCEL mutation params (PLR uses defaults: mutation_fn=None disables mutations)
+    parser.add_argument("--plr_mutation_fn", type=str, default=None)
+    parser.add_argument("--plr_n_mutations", type=int, default=0)
+    parser.add_argument("--plr_mutation_criterion", type=str, default="batch")
+    parser.add_argument("--plr_mutation_subsample_size", type=int, default=1)
 
     # PAIRED-specific hyperparameters (ignored for other runners)
     parser.add_argument("--teacher_entropy_coef", type=float, default=0.05)
