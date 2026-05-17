@@ -56,8 +56,7 @@ def make_runner(args):
         replace_wall_pos=True,
     )
 
-    # PLR uses a fixed wall count so the level buffer can track specific levels.
-    if args.runner == "plr":
+    if args.runner == "dr":
         env_kwargs.update(sample_n_walls=False)
 
     dummy_env, _ = envs.make("Maze", env_kwargs=env_kwargs)
