@@ -3,6 +3,11 @@ Encoding and decoding between maze levels and diffusion-model images.
 
 The diffusion model operates on theta in R^{16x16x3}. This module converts
 between (wall_map, agent_pos, goal_pos, agent_dir) and theta images.
+
+Soft maze utilities:
+  theta_to_soft_maze_map  — differentiable theta → padded maze_map (21,21,3)
+  soft_extract_obs        — differentiable egocentric 5×5 obs crop
+Both are used by the PPO-value guided DDIM in guidance.py.
 """
 
 import jax
@@ -11,6 +16,28 @@ import jax.numpy as jnp
 
 GRID_SIZE = 13
 IMG_SIZE = 16
+
+# Padded maze_map dimensions (matches make_maze_map with pad_obs=True, view_size=5).
+_MAZE_PAD = 4           # view_size - 1
+_MAZE_H = 13 + 2 * _MAZE_PAD   # 21
+_MAZE_W = 13 + 2 * _MAZE_PAD   # 21
+
+# Normalized tile values (/10) for MiniGrid encoding used by maze env:
+#   wall:  OBJECT=2, COLOR_grey=5,   state=0  → [0.2, 0.5, 0.0]
+#   empty: OBJECT=1, COLOR=0,        state=0  → [0.1, 0.0, 0.0]
+#   goal:  OBJECT=8, COLOR_green=1,  state=0  → [0.8, 0.1, 0.0]
+# (agent tile is omitted: see_agent=False replaces it with empty in obs)
+_WALL_TILE  = jnp.array([0.2, 0.5, 0.0], dtype=jnp.float32)
+_EMPTY_TILE = jnp.array([0.1, 0.0, 0.0], dtype=jnp.float32)
+_GOAL_TILE  = jnp.array([0.8, 0.1, 0.0], dtype=jnp.float32)
+
+# Per-direction start offsets (in padded maze_map frame) relative to the
+# agent's padded position [row+pad, col+pad], so that dynamic_slice gives the
+# same 5×5 window as get_obs() in maze.py.
+# Derived by tracing get_obs() for each of the four directions.
+# Layout: row_offset, col_offset for dir in {0=right, 1=down, 2=left, 3=up}.
+_OBS_ROW_OFFSETS = jnp.array([-2,  0, -2, -4], dtype=jnp.int32)
+_OBS_COL_OFFSETS = jnp.array([ 0, -2, -4, -2], dtype=jnp.int32)
 
 # Direction offsets as (row_offset, col_offset).
 # 0=right, 1=down, 2=left, 3=up.
@@ -144,3 +171,89 @@ def sample_random_theta(rng: jnp.ndarray) -> jnp.ndarray:
     """Sample a random level and encode it as a theta image. Vmappable."""
     wall_map, agent_pos, goal_pos, agent_dir = sample_random_level(rng)
     return encode_level(wall_map, agent_pos, goal_pos, agent_dir)
+
+
+# ---------------------------------------------------------------------------
+# Differentiable soft maze utilities (used by PPO-value guided DDIM)
+# ---------------------------------------------------------------------------
+
+def theta_to_soft_maze_map(theta: jnp.ndarray, sharpness: float = 20.0) -> jnp.ndarray:
+    """Differentiable theta (16,16,3) → padded soft maze_map (21,21,3).
+
+    Produces a differentiable approximation of the integer maze_map built by
+    make_maze_map(pad_obs=True), normalized by /10 to match normalize_obs=True.
+    Used to extract differentiable egocentric observations for PPO-value guidance.
+
+    The agent tile is omitted (treated as empty) because see_agent=False in the
+    training env replaces the agent cell with empty in get_obs().
+    """
+    inner = theta[1:14, 1:14]          # (13, 13, 3) — strip theta border padding
+
+    wall_p  = inner[..., 0]            # wall probability (channel 0)
+    # Channel 1 encodes agent (1.0) and direction marker (0.5); threshold at 0.75.
+    agent_p = jax.nn.sigmoid(sharpness * (inner[..., 1] - 0.75))
+    goal_p  = inner[..., 2]            # goal probability (channel 2)
+    empty_p = jnp.clip(1.0 - wall_p - agent_p - goal_p, 0.0, 1.0)
+
+    # Weighted soft tile: each pixel is a mixture of tile types.
+    # ch0 = object-type channel / 10, ch1 = color channel / 10, ch2 = 0
+    ch0 = 0.2 * wall_p + 0.1 * empty_p + 0.8 * goal_p + 1.0 * agent_p
+    ch1 = 0.5 * wall_p + 0.0 * empty_p + 0.1 * goal_p + 0.0 * agent_p
+    ch2 = jnp.zeros_like(ch0)
+    inner_soft = jnp.stack([ch0, ch1, ch2], axis=-1)   # (13, 13, 3)
+
+    # Initialize padded map with wall tile then write inner grid.
+    padded = jnp.tile(_WALL_TILE[None, None, :], (_MAZE_H, _MAZE_W, 1))   # (21,21,3)
+    padded = padded.at[_MAZE_PAD:-_MAZE_PAD, _MAZE_PAD:-_MAZE_PAD, :].set(inner_soft)
+
+    # Re-apply surrounding wall border at wall_start = pad-1 = 3 (matches
+    # make_maze_map's explicit border, which sits just inside the padding).
+    ws = _MAZE_PAD - 1          # 3
+    we = GRID_SIZE + _MAZE_PAD  # 17
+    padded = padded.at[ws, ws:we + 1, :].set(_WALL_TILE)   # top
+    padded = padded.at[we, ws:we + 1, :].set(_WALL_TILE)   # bottom
+    padded = padded.at[ws:we + 1, ws, :].set(_WALL_TILE)   # left
+    padded = padded.at[ws:we + 1, we, :].set(_WALL_TILE)   # right
+
+    return padded   # (21, 21, 3)
+
+
+def soft_extract_obs(
+    soft_padded_map: jnp.ndarray,   # (21, 21, 3)
+    agent_pos_xy: jnp.ndarray,      # (2,) in (col, row) = (x, y) inner coords
+    agent_dir_idx: jnp.ndarray,     # scalar int {0,1,2,3}
+    view_size: int = 5,
+) -> jnp.ndarray:                   # (view_size, view_size, 3)
+    """Differentiable egocentric obs extraction matching maze.py get_obs().
+
+    Uses jax.lax.dynamic_slice (differentiable through values) to crop the
+    soft padded maze map at the agent's position, then applies the same rot90
+    rotation that get_obs() uses.  Positions are integer (non-differentiable
+    indices from cached trajectory); values in the map are differentiable w.r.t.
+    theta.
+
+    agent_pos_xy: (col, row) — matches EnvState.agent_pos convention.
+    """
+    col = agent_pos_xy[0].astype(jnp.int32)
+    row = agent_pos_xy[1].astype(jnp.int32)
+
+    # Padded map position of agent: [row + pad, col + pad].
+    # Slice start relative to that, derived from _OBS_ROW/COL_OFFSETS.
+    pad = _MAZE_PAD
+    row_start = row + pad + _OBS_ROW_OFFSETS[agent_dir_idx]
+    col_start = col + pad + _OBS_COL_OFFSETS[agent_dir_idx]
+
+    raw = jax.lax.dynamic_slice(
+        soft_padded_map,
+        (row_start, col_start, 0),
+        (view_size, view_size, 3),
+    )   # (view_size, view_size, 3)
+
+    # Apply the same rotation as get_obs() in maze.py.
+    obs = (
+        (agent_dir_idx == 0) * jnp.rot90(raw, 1)
+        + (agent_dir_idx == 1) * jnp.rot90(raw, 2)
+        + (agent_dir_idx == 2) * jnp.rot90(raw, 3)
+        + (agent_dir_idx == 3) * jnp.rot90(raw, 4)
+    )
+    return obs   # (view_size, view_size, 3)

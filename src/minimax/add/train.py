@@ -1,13 +1,22 @@
-"""Stage 3: Full ADD training — RL with regret-guided diffusion.
+"""Stage 3: Full ADD training — RL with PPO-value GAE guided diffusion.
 
 Usage:
     tpu-device 0 python -m minimax.add.train --diffusion_ckpt checkpoints/diffusion/final.pkl
 
 The full ADD loop:
-  1. ADDRunner.run() samples levels via guided DDIM (omega=0 until critic ready).
+  1. ADDRunner.run() samples levels via PPO-value guided DDIM.
+     Guidance signal = mean(|GAE advantage|) computed differentiably from the
+     current PPO value head and a soft maze map derived from the predicted
+     clean level x0_pred.  Gradient is taken w.r.t. x0_pred only (no UNet
+     backprop), identical in spirit to classifier guidance.
   2. PPO rollouts collect per-level episodic returns.
-  3. Environment critic is trained on (level, return) pairs.
-  4. Updated critic params are passed to the next run() call.
+  3. Per-step agent positions are cached from the rollout and fed back into
+     the DDIM guidance on the next iteration.
+
+Changes from the EnvCritic version:
+  - Removed: EnvCritic, CriticBuffer, critic_params, train_critic
+  - Added:   cached_rollout dict (pos/dir/done from prior rollout)
+  - omega=0 for the first iteration (no cache available), then args.omega
 """
 
 import argparse
@@ -17,33 +26,23 @@ import time
 import numpy as np
 import jax
 import jax.numpy as jnp
-import optax
 
 import minimax.envs as envs
 import minimax.models as models
 import minimax.agents as agents
 from minimax.runners.eval_runner import EvalRunner
 
-from minimax.add.runner import ADDRunner
+from minimax.add.runner import ADDRunner, _T_SUB
 from minimax.add.theta import decode_level
 from minimax.add.diffusion import make_schedule
 import minimax.util.graph as graph_util
-from minimax.add.critic import (
-    CriticBuffer, make_critic_train_step, train_critic,
-)
 
 
 @jax.jit
 def compute_complexity_metrics(thetas):
-    """Compute wall count and shortest path from a batch of theta images.
-
-    Uses minimax's JIT-compiled APSP shortest path, vmapped over the batch.
-    Returns (n_walls, path_lengths) as JAX arrays, shape (B,).
-    Path length is 0 for unsolvable levels.
-    """
+    """Compute wall count and shortest path from a batch of theta images."""
     wall_maps, agent_pos_rc, goal_pos_rc, _ = jax.vmap(decode_level)(thetas)
     n_walls = wall_maps.sum(axis=(1, 2))
-    # decode_level returns (row, col); minimax graph uses (col, row)
     agent_pos_xy = agent_pos_rc[:, ::-1].astype(jnp.uint32)
     goal_pos_xy = goal_pos_rc[:, ::-1].astype(jnp.uint32)
     path_lengths = jax.vmap(graph_util.shortest_path_len)(
@@ -68,12 +67,20 @@ EVAL_ENV_NAMES = [
 ]
 
 
+def _make_zero_cached_rollout(n_parallel, t_sub=_T_SUB):
+    """Placeholder cached_rollout for the first iteration (omega=0 → unused)."""
+    return {
+        "pos":  jnp.zeros((t_sub + 1, n_parallel, 2), dtype=jnp.uint32),
+        "dir":  jnp.zeros((t_sub + 1, n_parallel), dtype=jnp.int32),
+        "done": jnp.zeros((t_sub, n_parallel), dtype=jnp.float32),
+    }
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Full ADD training (Stage 3)")
+    parser = argparse.ArgumentParser(description="Full ADD training (Stage 3, PPO-value guidance)")
     parser.add_argument("--diffusion_ckpt", type=str, required=True)
     parser.add_argument("--ddim_steps", type=int, default=50)
     parser.add_argument("--omega", type=float, default=5.0)
-    parser.add_argument("--alpha", type=float, default=0.15)
     parser.add_argument("--unet_attn_res", type=int, nargs="+", default=None,
                         help="Override UNet attention_resolutions (e.g. 4 2 for v1)")
     parser.add_argument("--unet_no_scale_shift", action="store_true",
@@ -94,13 +101,6 @@ def main():
     parser.add_argument("--ppo_clip", type=float, default=0.2)
     parser.add_argument("--entropy_coef", type=float, default=0.0)
 
-    parser.add_argument("--critic_lr", type=float, default=3e-4)
-    parser.add_argument("--critic_weight_decay", type=float, default=0.05)
-    parser.add_argument("--critic_grad_clip", type=float, default=1.0,
-                        help="Global grad norm clip for critic (0 to disable)")
-    parser.add_argument("--critic_buffer_size", type=int, default=1600)
-    parser.add_argument("--critic_train_iters", type=int, default=5)
-    parser.add_argument("--critic_batch_size", type=int, default=128)
     parser.add_argument("--n_updates", type=int, default=30000)
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--eval_every", type=int, default=100)
@@ -116,11 +116,7 @@ def main():
     steps_per_update = args.n_parallel * args.rollout_steps
     total_steps = args.n_updates * steps_per_update
     print(f"JAX devices: {jax.devices()}")
-    print(f"Full ADD | {total_steps:,} total env steps | omega={args.omega}")
-    print(f"  replay=ON | targets=distributional"
-          f" | critic_lr={args.critic_lr}"
-          f" | wd={args.critic_weight_decay}"
-          f" | grad_clip={args.critic_grad_clip}")
+    print(f"Full ADD (PPO-value guidance) | {total_steps:,} total env steps | omega={args.omega}")
 
     # --- Environment and agent setup ---
     env_kwargs = dict(
@@ -141,7 +137,7 @@ def main():
         entropy_coef=args.entropy_coef,
     )
 
-    # --- ADD runner (handles diffusion sampling + RL rollouts) ---
+    # --- ADD runner ---
     unet_kwargs = {}
     if args.unet_attn_res is not None:
         unet_kwargs["attention_resolutions"] = tuple(args.unet_attn_res)
@@ -153,7 +149,6 @@ def main():
     runner = ADDRunner(
         diffusion_ckpt_path=args.diffusion_ckpt,
         ddim_steps=args.ddim_steps,
-        alpha=args.alpha,
         unet_kwargs=unet_kwargs or None,
         env_name="Maze",
         env_kwargs=env_kwargs,
@@ -175,32 +170,12 @@ def main():
         n_episodes=args.eval_episodes,
     )
 
-    # --- Critic setup ---
-    rng = jax.random.PRNGKey(args.seed)
-    rng, critic_rng = jax.random.split(rng)
-    critic_params = runner.init_critic_params(critic_rng)
-    critic_opt_parts = []
-    if args.critic_grad_clip > 0:
-        critic_opt_parts.append(optax.clip_by_global_norm(args.critic_grad_clip))
-    critic_opt_parts.append(optax.adamw(args.critic_lr, weight_decay=args.critic_weight_decay))
-    critic_optimizer = optax.chain(*critic_opt_parts)
-    critic_opt_state = critic_optimizer.init(critic_params)
-    critic_buffer = CriticBuffer(capacity=args.critic_buffer_size)
-    critic_step = make_critic_train_step(runner.critic_model, critic_optimizer)
-    schedule = make_schedule()
-
-    n_cp = sum(p.size for p in jax.tree.leaves(critic_params))
-    print(f"Critic parameters: {n_cp:,}")
-    print("Loaded diffusion checkpoint")
-
-    def save_checkpoint(tick, train_steps, runner_state, critic_params, critic_opt_state):
+    def save_checkpoint(tick, train_steps, runner_state):
         path = os.path.join(ckpt_dir, f"step_{train_steps:09d}.pkl")
         data = {
             "tick": tick,
             "train_steps": train_steps,
             "rl_params": jax.device_get(runner_state[1].params),
-            "critic_params": jax.device_get(critic_params),
-            "critic_opt_state": jax.device_get(critic_opt_state),
             "args": vars(args),
         }
         with open(path, "wb") as f:
@@ -208,45 +183,36 @@ def main():
         print(f"  saved {path}")
 
     # --- Training loop ---
+    rng = jax.random.PRNGKey(args.seed)
     runner_state = runner.reset(rng)
     t0 = time.time()
     tick = 0
     train_steps = 0
 
+    # Placeholder cache for the first iteration; omega=0 disables guidance.
+    cached_rollout = _make_zero_cached_rollout(args.n_parallel)
+
     while tick < args.n_updates:
-        rng, rng_critic = jax.random.split(rng)
+        rng, _ = jax.random.split(rng)
 
-        # omega=0 disables guidance; omega>0 enables it once critic is trained.
-        omega = jnp.array(args.omega if critic_buffer.is_full else 0.0)
+        # omega=0 on first iter (no cache); args.omega thereafter.
+        omega = jnp.array(args.omega if tick > 0 else 0.0)
 
-        # run() takes critic_params and omega as traced args.
         stats, *runner_state = runner.run(
-            *runner_state, critic_params, omega,
+            *runner_state, cached_rollout, omega,
         )
         train_steps += steps_per_update
         tick += 1
 
-        # Collect targets (computed inside JIT'd runner via batch_rollout_to_targets).
-        targets_np = np.array(jax.device_get(stats["_targets"]))      # (n_parallel, 100)
-        thetas_np = np.array(jax.device_get(stats["_thetas"]))        # (n_parallel, 16, 16, 3)
+        # Update rollout cache for next iteration's guidance.
+        cached_rollout = {
+            "pos":  jnp.array(jax.device_get(stats["_cached_pos"])),
+            "dir":  jnp.array(jax.device_get(stats["_cached_dir"])),
+            "done": jnp.array(jax.device_get(stats["_cached_done"])),
+        }
+
         mean_return = float(jax.device_get(stats["_mean_return"]))
-
-        if not np.any(np.isnan(thetas_np)):
-            critic_buffer.add(thetas_np, targets_np)
-
-        # Train critic if buffer is full.
-        critic_loss = 0.0
-        if critic_buffer.is_full:
-            critic_params, critic_opt_state, critic_loss = train_critic(
-                critic_step=critic_step,
-                critic_params=critic_params,
-                opt_state=critic_opt_state,
-                buffer=critic_buffer,
-                rng=rng_critic,
-                schedule=schedule,
-                num_iterations=args.critic_train_iters,
-                batch_size=args.critic_batch_size,
-            )
+        thetas_np = np.array(jax.device_get(stats["_thetas"]))
 
         # Logging.
         if tick % args.log_every == 0:
@@ -257,7 +223,6 @@ def main():
                 f"update {tick:>6d}/{args.n_updates} | "
                 f"steps {train_steps:>10,} | "
                 f"return {mean_return:.3f} | "
-                f"critic {critic_loss:.4f} | "
                 f"{guided_str} | "
                 f"{sps:.0f} sps"
             )
@@ -288,9 +253,9 @@ def main():
             print(f"  complexity | walls {float(n_walls.mean()):.1f}±{float(n_walls.std()):.1f} | path {pl_str} | solv {n_solv}/{len(n_walls)}")
 
         if tick % args.save_every == 0:
-            save_checkpoint(tick, train_steps, runner_state, critic_params, critic_opt_state)
+            save_checkpoint(tick, train_steps, runner_state)
 
-    save_checkpoint(tick, train_steps, runner_state, critic_params, critic_opt_state)
+    save_checkpoint(tick, train_steps, runner_state)
     total_time = time.time() - t0
     print(f"Training complete in {total_time/3600:.1f}h, {train_steps:,} steps")
 
