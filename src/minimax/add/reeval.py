@@ -51,7 +51,7 @@ def make_agent_pop():
     """Create the same agent architecture used during training."""
     env_kwargs = dict(
         height=13, width=13, n_walls=25, see_through_walls=True,
-        agent_view_size=5, max_episode_steps=250, normalize_obs=False,
+        agent_view_size=5, max_episode_steps=250, normalize_obs=True,
         sample_n_walls=True, replace_wall_pos=True,
     )
     dummy_env, _ = envs.make("Maze", env_kwargs=env_kwargs)
@@ -85,7 +85,7 @@ def evaluate_checkpoint(pop, params, env_names, n_episodes, rng):
     eval_runner = EvalRunner(
         pop=pop,
         env_names=env_names,
-        env_kwargs={},
+        env_kwargs={"normalize_obs": True},
         n_episodes=n_episodes,
     )
     eval_stats = eval_runner.run(rng, params)
@@ -126,7 +126,7 @@ def main():
     rng = jax.random.PRNGKey(0)
     dummy_env, _ = envs.make("Maze", env_kwargs=dict(
         height=13, width=13, n_walls=25, see_through_walls=True,
-        agent_view_size=5, max_episode_steps=250, normalize_obs=False,
+        agent_view_size=5, max_episode_steps=250, normalize_obs=True,
     ))
     dummy_obs, _ = dummy_env.reset_env(rng)
     dummy_obs_batched = jax.tree.map(lambda x: x[None], dummy_obs)

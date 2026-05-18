@@ -88,24 +88,7 @@ class ADDRunner(DRRunner):
         return jax.vmap(self.benv.env.set_env_instance)(instances_repeated)
 
     @partial(jax.jit, static_argnums=(0,))
-    def sample_levels(self, rng, critic_params, omega):
-        """Guided DDIM sampling, compiled separately from the RL rollout.
-
-        Keeping diffusion (with jax.grad inside fori_loop) and RL in a single
-        JIT produces an HLO program too large for XLA to compile in reasonable
-        time. Splitting them into two JITs keeps each compilation manageable.
-        """
-        rng, *diff_rngs = jax.random.split(rng, self.n_students + 1)
-
-        def _sample(rng):
-            thetas = self._sample_thetas(rng, self.n_parallel, critic_params, omega)
-            instances = self._decode_to_instances(thetas)
-            return thetas, instances
-
-        return jax.vmap(_sample)(jnp.array(diff_rngs))
-
-    @partial(jax.jit, static_argnums=(0,))
-    def _run_rl(
+    def run(
         self,
         rng,
         train_state,
@@ -115,11 +98,24 @@ class ADDRunner(DRRunner):
         carry,
         extra,
         ep_stats,
-        all_thetas,
-        all_instances,
+        critic_params,
+        omega,
     ):
-        """RL rollout + PPO on pre-sampled levels."""
+        if self.n_devices > 1:
+            rng = jax.random.fold_in(rng, jax.lax.axis_index("device"))
+
         rollout_batch_shape = (self.n_students, self.n_parallel * self.n_eval)
+
+        rng, *diff_rngs = jax.random.split(rng, self.n_students + 1)
+
+        def _sample_thetas_and_instances(rng):
+            thetas = self._sample_thetas(rng, self.n_parallel, critic_params, omega)
+            instances = self._decode_to_instances(thetas)
+            return thetas, instances
+
+        all_thetas, all_instances = jax.vmap(_sample_thetas_and_instances)(
+            jnp.array(diff_rngs)
+        )
 
         obs, state, extra = jax.vmap(
             lambda inst: self._reset_from_instances(None, inst, self.n_parallel, self.n_eval)
@@ -175,6 +171,7 @@ class ADDRunner(DRRunner):
         stats["_mean_return"] = mean_return
 
         train_state = train_state.increment()
+        self.n_updates += 1
 
         return (
             stats,
@@ -187,34 +184,3 @@ class ADDRunner(DRRunner):
             extra,
             ep_stats,
         )
-
-    def run(
-        self,
-        rng,
-        train_state,
-        state,
-        start_state,
-        obs,
-        carry,
-        extra,
-        ep_stats,
-        critic_params,
-        omega,
-    ):
-        """Full ADD step: guided DDIM sampling then RL rollout + PPO.
-
-        Calls two separately compiled JITs so each compiles in reasonable time.
-        External signature is unchanged from the original single-JIT version.
-        """
-        if self.n_devices > 1:
-            rng = jax.random.fold_in(rng, jax.lax.axis_index("device"))
-
-        rng, sample_rng = jax.random.split(rng)
-        all_thetas, all_instances = self.sample_levels(sample_rng, critic_params, omega)
-
-        result = self._run_rl(
-            rng, train_state, state, start_state, obs, carry, extra, ep_stats,
-            all_thetas, all_instances,
-        )
-        self.n_updates += 1
-        return result

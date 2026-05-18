@@ -125,7 +125,7 @@ def main():
     # --- Environment and agent setup ---
     env_kwargs = dict(
         height=13, width=13, n_walls=60, see_through_walls=True,
-        agent_view_size=5, max_episode_steps=250, normalize_obs=False,
+        agent_view_size=5, max_episode_steps=250, normalize_obs=True,
         sample_n_walls=True, replace_wall_pos=True,
     )
     dummy_env, _ = envs.make("Maze", env_kwargs=env_kwargs)
@@ -171,7 +171,7 @@ def main():
     eval_runner = EvalRunner(
         pop=runner.student_pop,
         env_names=EVAL_ENV_NAMES,
-        env_kwargs={},
+        env_kwargs={"normalize_obs": True},
         n_episodes=args.eval_episodes,
     )
 
