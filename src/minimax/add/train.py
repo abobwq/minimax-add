@@ -29,7 +29,7 @@ from minimax.add.theta import decode_level
 from minimax.add.diffusion import make_schedule
 import minimax.util.graph as graph_util
 from minimax.add.critic import (
-    CriticBuffer, make_critic_train_step, train_critic,
+    CriticBuffer, make_critic_train_step, train_critic, returns_to_categorical,
 )
 
 
@@ -51,6 +51,8 @@ def compute_complexity_metrics(thetas):
     )
     return n_walls, path_lengths
 
+
+PATH_LEN_MAX = 100.0   # normalize path length to [0, 1]; clips paths > 100
 
 EVAL_ENV_NAMES = [
     "Maze-FourRooms",
@@ -226,12 +228,14 @@ def main():
         train_steps += steps_per_update
         tick += 1
 
-        # Collect targets (computed inside JIT'd runner via batch_rollout_to_targets).
-        targets_np = np.array(jax.device_get(stats["_targets"]))      # (n_parallel, 100)
+        # Collect thetas and compute path-length targets (cheat critic).
         thetas_np = np.array(jax.device_get(stats["_thetas"]))        # (n_parallel, 16, 16, 3)
         mean_return = float(jax.device_get(stats["_mean_return"]))
 
         if not np.any(np.isnan(thetas_np)):
+            _, path_lengths = compute_complexity_metrics(jnp.array(thetas_np))
+            path_lengths_norm = jnp.clip(path_lengths / PATH_LEN_MAX, 0.0, 1.0)
+            targets_np = np.array(returns_to_categorical(path_lengths_norm, num_bins=100))
             critic_buffer.add(thetas_np, targets_np)
 
         # Train critic if buffer is full.

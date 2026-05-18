@@ -10,7 +10,7 @@ from minimax.add.diffusion import (
     _make_ddim_timesteps,
     diffusion_to_theta,
 )
-from minimax.add.critic import regret
+from minimax.add.critic import categorical_mean
 
 
 ModelFn = Callable  # (params, x_t, t_batch) -> output
@@ -68,15 +68,15 @@ def guided_ddim_sample(
         # Re-derive eps from clamped x0 (consistent baseline for guidance).
         eps_clean = (x - sqrt_ab_t * x0_pred) / sqrt_1m_ab_t
 
-        # Regret gradient w.r.t. x_t (critic params frozen).
-        def regret_sum(x_t):
+        # Path-length gradient w.r.t. x_t (critic params frozen).
+        def path_length_sum(x_t):
             logits = critic_model_fn(critic_params, x_t, t_batch)
-            return regret(logits, alpha, num_bins, min_return, max_return).sum()
+            return categorical_mean(logits, num_bins, min_return, max_return).sum()
 
-        grad_regret = jax.grad(regret_sum)(x)
+        grad_path_length = jax.grad(path_length_sum)(x)
 
-        # Classifier-guidance: shift cleaned eps by the regret gradient.
-        eps_guided = eps_clean - sqrt_1m_ab_t * omega * grad_regret
+        # Classifier-guidance: shift cleaned eps by the path-length gradient.
+        eps_guided = eps_clean - sqrt_1m_ab_t * omega * grad_path_length
 
         # Predict guided x0 (NOT clamped — guidance may push beyond [-1, 1]).
         x0_guided = (x - sqrt_1m_ab_t * eps_guided) / sqrt_ab_t
