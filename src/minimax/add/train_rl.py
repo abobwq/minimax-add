@@ -119,7 +119,7 @@ def make_runner(args):
             n_walls=args.n_walls,
             noise_dim=50,
             replace_wall_pos=True,
-            fixed_n_wall_steps=True,
+            fixed_n_wall_steps=args.paired_fixed_n_wall_steps,
             first_wall_pos_sets_budget=False,
             set_agent_dir=False,
             normalize_obs=True,
@@ -246,6 +246,8 @@ def main():
     parser.add_argument("--plr_mutation_subsample_size", type=int, default=1)
 
     # PAIRED-specific hyperparameters (ignored for other runners)
+    parser.add_argument("--paired_fixed_n_wall_steps", action=argparse.BooleanOptionalAction, default=True,
+                        help="Teacher places exactly n_walls walls (True, paper default) or a variable count (False).")
     parser.add_argument("--teacher_entropy_coef", type=float, default=0.05)
     parser.add_argument("--teacher_gae_lambda", type=float, default=0.98)
     parser.add_argument("--teacher_discount", type=float, default=0.995)
@@ -330,13 +332,20 @@ def main():
                 for name, rate in sorted(solved_rates.items()):
                     print(f"    {name}: {rate:.1%}")
 
-            walls = stats.get("env/n_walls")
-            path = stats.get("env/shortest_path_length")
-            passable = stats.get("env/passable_ratio")
+            def _first_finite(stats, *keys):
+                for k in keys:
+                    v = stats.get(k)
+                    if v is not None and np.isfinite(float(v)):
+                        return float(v)
+                return None
+
+            walls   = _first_finite(stats, "plr/n_walls",             "env/n_walls")
+            path    = _first_finite(stats, "plr/shortest_path_length", "env/shortest_path_length")
+            passable = _first_finite(stats, "plr/passable_ratio",      "env/passable_ratio")
             if walls is not None and path is not None and passable is not None:
-                p_frac = float(passable)
-                walls_str = f"{float(walls):.1f}" if p_frac > 0 else "n/a"
-                path_str = f"{float(path):.1f}" if p_frac > 0 else "n/a"
+                p_frac = passable
+                walls_str = f"{walls:.1f}" if p_frac > 0 else "n/a"
+                path_str  = f"{path:.1f}"  if p_frac > 0 else "n/a"
                 print(
                     f"  complexity | walls {walls_str} | path {path_str} | "
                     f"passable {p_frac:.1%} (means over passable levels)"
