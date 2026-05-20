@@ -61,7 +61,7 @@ def decode_level(
 
     # Walls: threshold at 0.99. No forced border — minimax handles grid
     # boundaries via position clamping, matching the ADD paper and DR generator.
-    wall_map = inner[:, :, 0] > 0.99
+    wall_map = inner[:, :, 0] > 0.5
 
     # Goal: brightest blue pixel in inner region.
     goal_flat = jnp.argmax(inner[:, :, 2].ravel())
