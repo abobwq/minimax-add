@@ -73,6 +73,10 @@ def main():
     parser.add_argument("--unet_attn_res", type=int, nargs="+", default=None)
     parser.add_argument("--unet_no_scale_shift", action="store_true")
     parser.add_argument("--unet_num_heads", type=int, default=None)
+    parser.add_argument("--dr_frac", type=float, default=0.5,
+                        help="Fraction of levels per rollout drawn from DR (0 = all diffusion)")
+    parser.add_argument("--dr_max_walls", type=int, default=60,
+                        help="DR wall budget: n_walls sampled uniform in [0, dr_max_walls]")
 
     parser.add_argument("--n_parallel", type=int, default=32)
     parser.add_argument("--rollout_steps", type=int, default=256)
@@ -135,6 +139,8 @@ def main():
         guidance_rollout_steps=args.guidance_rollout_steps,
         rollout_every=args.rollout_every,
         use_positive_value_loss=(args.guidance_ued_score == "positive_value_loss"),
+        dr_frac=args.dr_frac,
+        dr_max_walls=args.dr_max_walls,
         unet_kwargs=unet_kwargs or None,
         env_name="Maze",
         env_kwargs=env_kwargs,

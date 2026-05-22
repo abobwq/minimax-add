@@ -10,6 +10,13 @@ Changes from diffV:
   - Removed: _rollout_students_collect_states, cached_rollout API
   - Added:   decode_and_reset_fn, env_step_fn passed into guidance
   - Uses:    ppo_value_guided_ddim_sample_theta_v2
+
+Hybrid DR/diffusion sampling (dr_frac):
+  - A fixed fraction (default 0.5) of levels per rollout are drawn from
+    domain randomisation (random Maze reset, walls uniform in [0, dr_max_walls]).
+  - The remaining fraction uses guided DDIM as normal.
+  - The split is deterministic given the shape: n_dr = round(n_parallel*dr_frac),
+    n_diff = n_parallel - n_dr.  Both branches run every tick; DR is cheap.
 """
 
 import pickle
@@ -20,6 +27,7 @@ import jax.numpy as jnp
 
 from minimax.runners.dr_runner import DRRunner
 from minimax.envs.maze.common import EnvInstance
+from minimax.envs.maze.maze import Maze
 
 from minimax.add.theta import decode_level
 from minimax.add.unet import UNet
@@ -40,6 +48,8 @@ class ADDRunner(DRRunner):
         guidance_rollout_steps: int = 256,
         rollout_every: int = 1,       # 1 = every step (diffV_v2 behaviour); >1 = v3 K-step
         use_positive_value_loss: bool = False,
+        dr_frac: float = 0.5,         # fraction of levels drawn from DR each tick
+        dr_max_walls: int = 60,       # DR wall budget: uniform in [0, dr_max_walls]
         unet_kwargs: dict | None = None,
         **kwargs,
     ):
@@ -52,6 +62,10 @@ class ADDRunner(DRRunner):
         self.rollout_every = rollout_every
         self.use_positive_value_loss = use_positive_value_loss
 
+        # Hybrid DR / diffusion split (resolved once at construction, static at JIT time).
+        self._n_dr   = max(0, round(self.n_parallel * dr_frac))
+        self._n_diff = self.n_parallel - self._n_dr
+
         with open(diffusion_ckpt_path, "rb") as f:
             ckpt = pickle.load(f)
         self.diff_params = jax.device_put(ckpt["ema_params"])
@@ -62,8 +76,22 @@ class ADDRunner(DRRunner):
         self._decode_and_reset_fn = self._make_decode_and_reset_fn()
         self._env_step_fn         = jax.vmap(self.benv.env.step)
 
+        # Bare maze env used only for DR resets (no wrappers, no agent).
+        if self._n_dr > 0:
+            ep = self.env.params
+            self._dr_env = Maze(
+                height=ep.height,
+                width=ep.width,
+                n_walls=dr_max_walls,
+                sample_n_walls=True,
+                agent_view_size=ep.agent_view_size,
+                see_through_walls=ep.see_through_walls,
+                see_agent=ep.see_agent,
+                normalize_obs=ep.normalize_obs,
+            )
+
     # ------------------------------------------------------------------
-    # Level sampling (guided DDIM)
+    # Level sampling (guided DDIM + DR hybrid)
     # ------------------------------------------------------------------
 
     def _make_decode_and_reset_fn(self):
@@ -108,6 +136,17 @@ class ADDRunner(DRRunner):
             kwargs["rollout_every"] = self.rollout_every
         return guidance_fn(**kwargs)
 
+    def _sample_dr_instances(self, rng, n_levels):
+        """Sample n_levels random maze instances via plain env reset (no diffusion)."""
+        rngs = jax.random.split(rng, n_levels)
+        _, states = jax.vmap(self._dr_env.reset_env)(rngs)
+        return EnvInstance(
+            agent_pos=states.agent_pos,
+            agent_dir_idx=states.agent_dir_idx,
+            goal_pos=states.goal_pos,
+            wall_map=states.wall_map,
+        )
+
     def _decode_to_instances(self, thetas):
         wall_maps, agent_pos_rc, goal_pos_rc, agent_dirs = jax.vmap(decode_level)(thetas)
         agent_pos_xy = agent_pos_rc[:, ::-1].astype(jnp.uint32)
@@ -127,15 +166,35 @@ class ADDRunner(DRRunner):
 
     @partial(jax.jit, static_argnums=(0,))
     def sample_levels(self, rng, ppo_params_s0, omega):
-        """Guided DDIM sampling, compiled separately from the RL rollout."""
-        rng, *diff_rngs = jax.random.split(rng, self.n_students + 1)
+        """Hybrid level sampling: n_diff guided DDIM + n_dr random DR per student."""
+        rng, *student_rngs = jax.random.split(rng, self.n_students + 1)
 
+        # _n_diff / _n_dr are Python ints — branches resolved at trace time.
         def _sample(rng):
-            thetas = self._sample_thetas(rng, self.n_parallel, ppo_params_s0, omega)
-            instances = self._decode_to_instances(thetas)
+            rng, diff_rng, dr_rng = jax.random.split(rng, 3)
+
+            # DR dummy thetas are 16×16 to match diffusion theta space.
+            _THETA_HW = 16
+            if self._n_diff > 0 and self._n_dr > 0:
+                diff_thetas = self._sample_thetas(diff_rng, self._n_diff, ppo_params_s0, omega)
+                diff_inst   = self._decode_to_instances(diff_thetas)
+                dr_inst     = self._sample_dr_instances(dr_rng, self._n_dr)
+                dr_thetas   = jnp.zeros((self._n_dr, _THETA_HW, _THETA_HW, 3))
+                thetas    = jnp.concatenate([diff_thetas, dr_thetas], axis=0)
+                instances = jax.tree.map(
+                    lambda a, b: jnp.concatenate([a, b], axis=0),
+                    diff_inst, dr_inst,
+                )
+            elif self._n_dr == 0:
+                thetas    = self._sample_thetas(diff_rng, self._n_diff, ppo_params_s0, omega)
+                instances = self._decode_to_instances(thetas)
+            else:
+                instances = self._sample_dr_instances(dr_rng, self._n_dr)
+                thetas    = jnp.zeros((self._n_dr, _THETA_HW, _THETA_HW, 3))
+
             return thetas, instances
 
-        return jax.vmap(_sample)(jnp.array(diff_rngs))
+        return jax.vmap(_sample)(jnp.array(student_rngs))
 
     # ------------------------------------------------------------------
     # RL rollout + PPO update
