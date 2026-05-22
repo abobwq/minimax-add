@@ -491,6 +491,25 @@ x0_guided = (x_t' − √(1−ᾱ_t) · ε_θ) / √ᾱ_t
 Only this last line is implemented — x0_pred is shifted directly, x_t is never
 touched.  The result: `step = 1/√ᾱ_t`.
 
+**Why computing grad w.r.t. x0_pred is sufficient:**
+The Jacobian ∂x0_pred/∂x_t = (1/√ᾱ_t) · I is a scalar multiple of the identity,
+so ∇_{x_t} f = (1/√ᾱ_t) · ∇_{x0_pred} f — the two gradients point in the same
+direction.  After per-level L2 normalisation (`use_grad_norm`) the scalar factor
+cancels:
+
+```
+∇_{x_t} f / ‖∇_{x_t} f‖  =  ∇_{x0_pred} f / ‖∇_{x0_pred} f‖
+```
+
+Therefore `grad_normalised` in the derivation above can be computed w.r.t. either
+x_t or x0_pred — the unit direction is identical.  The code computes it w.r.t.
+x0_pred (because the score function is defined on decoded levels, not on x_t), and
+`step = 1/√ᾱ_t` accounts for the remaining magnitude difference.
+
+Note: without `use_grad_norm` the direction argument does not apply and the
+consistent step would be `1/ᾱ_t` rather than `1/√ᾱ_t`.  At end-biased late steps
+ᾱ_t ≈ 1 so the difference is negligible, but `use_grad_norm` is always recommended.
+
 At end-biased late steps √ᾱ_t ≈ 1, so step ≈ 1 and ω is a direct step size in
 x0_pred space.  The formula does not vanish.
 
