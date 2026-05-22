@@ -48,6 +48,7 @@ def make_runner(args):
         height=13,
         width=13,
         n_walls=args.n_walls,
+        n_walls_min=args.n_walls_min,
         see_through_walls=True,
         agent_view_size=5,
         max_episode_steps=250,
@@ -216,6 +217,8 @@ def main():
                              "needed by v1/v2/v3 checkpoints.")
 
     parser.add_argument("--n_walls", type=int, default=25)
+    parser.add_argument("--n_walls_min", type=int, default=0,
+                        help="Lower bound for wall count when sample_n_walls=True.")
     parser.add_argument("--sample_n_walls", action=argparse.BooleanOptionalAction, default=None,
                         help="Override sample_n_walls. Default: False for dr/accel, True for plr.")
     parser.add_argument("--n_parallel", type=int, default=32)

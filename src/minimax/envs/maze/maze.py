@@ -71,7 +71,8 @@ class EnvParams:
 	see_through_walls: bool = True
 	see_agent: bool = False
 	normalize_obs: bool = False
-	sample_n_walls: bool = False # Sample n_walls uniformly in [0, n_walls]
+	sample_n_walls: bool = False # Sample n_walls uniformly in [n_walls_min, n_walls]
+	n_walls_min: int = 0
 	obs_agent_pos: bool = False
 	max_episode_steps: int = 250
 	singleton_seed: int = -1,
@@ -90,6 +91,7 @@ class Maze(environment.Environment):
 		max_episode_steps=250,
 		normalize_obs=False,
 		sample_n_walls=False,
+		n_walls_min=0,
 		obs_agent_pos=False,
 		singleton_seed=-1
 	):
@@ -117,6 +119,7 @@ class Maze(environment.Environment):
 			max_episode_steps=max_episode_steps,
 			normalize_obs=normalize_obs,
 			sample_n_walls=sample_n_walls,
+			n_walls_min=n_walls_min,
 			obs_agent_pos=obs_agent_pos,
 			singleton_seed=-1,
 		)
@@ -171,7 +174,7 @@ class Maze(environment.Environment):
 
 		if params.sample_n_walls:
 			key, subkey = jax.random.split(key)
-			sampled_n_walls = jax.random.randint(subkey, (), minval=0, maxval=params.n_walls)
+			sampled_n_walls = jax.random.randint(subkey, (), minval=params.n_walls_min, maxval=params.n_walls + 1)
 			sample_wall_mask = jnp.arange(params.n_walls) < sampled_n_walls
 			dummy_wall_idx = wall_idx.at[0].get().repeat(params.n_walls)
 			wall_idx = jax.lax.select(

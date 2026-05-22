@@ -594,11 +594,16 @@ env_maze_parser.add_argument(
     help='Sample wall positions with replacement.')
 env_maze_parser.add_argument(
     '--sample_n_walls',
-    type=str2bool, 
-    nargs='?', 
-    const=True, 
+    type=str2bool,
+    nargs='?',
+    const=True,
     default=False,
-    help='Uniformly sample n_walls between 0 and n_walls.')
+    help='Uniformly sample n_walls between n_walls_min and n_walls.')
+env_maze_parser.add_argument(
+    '--n_walls_min',
+    type=int,
+    default=0,
+    help='Lower bound for wall count when sample_n_walls=True (default 0).')
 # -------- Maze* environments --------
 env_maze_all_parser = parser.add_subparser(
     name='maze_all',
