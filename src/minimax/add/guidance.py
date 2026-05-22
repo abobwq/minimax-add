@@ -31,6 +31,25 @@ from minimax.add.theta import (
 ModelFn = Callable  # (params, x_t, t_batch) -> output
 
 
+def _guided_x0(grad: jnp.ndarray, x0_pred: jnp.ndarray,
+               omega: float, x0_clamp: float,
+               sqrt_1m_ab_t: jnp.ndarray,
+               sqrt_ab_t: jnp.ndarray) -> jnp.ndarray:
+    """Apply raw gradient guidance and return clamped x0_guided.
+
+    No grad normalization — omega is calibrated against the raw gradient
+    magnitude, matching the original v3 behaviour.  x0_clamp prevents
+    runaway into OOD territory for the UNet (trained on x0 ∈ [-1, 1]).
+
+    Formula (algebra of the eps detour):
+        x0_guided = x0_pred + (1-ᾱ)/√ᾱ · ω · grad
+                  = x0_pred + (sqrt_1m_ab_t² / sqrt_ab_t) · ω · grad
+    """
+    step = (sqrt_1m_ab_t ** 2) / sqrt_ab_t   # (1-ᾱ)/√ᾱ, scalar
+    x0_guided = x0_pred + step * omega * grad
+    return jnp.clip(x0_guided, -x0_clamp, x0_clamp)
+
+
 def guided_ddim_sample(
     diff_model_fn: ModelFn,
     diff_params,
@@ -342,6 +361,7 @@ def ppo_value_guided_ddim_sample_theta_v2(
     gamma: float = 0.995,
     gae_lambda: float = 0.95,
     use_positive_value_loss: bool = False,
+    x0_clamp: float = 3.0,
 ) -> jnp.ndarray:
     """On-policy PPO-value GAE guided DDIM sampling (diffV_v2).
 
@@ -504,10 +524,9 @@ def ppo_value_guided_ddim_sample_theta_v2(
 
         grad_score = jax.grad(gae_score_sum)(x0_pred)
 
-        eps_guided = eps_clean - sqrt_1m_ab_t * omega * grad_score
-        x0_guided  = (x - sqrt_1m_ab_t * eps_guided) / sqrt_ab_t
-        eps_final  = (x - sqrt_ab_t * x0_guided) / sqrt_1m_ab_t
-
+        x0_guided = _guided_x0(grad_score, x0_pred, omega, x0_clamp,
+                                sqrt_1m_ab_t, sqrt_ab_t)
+        eps_final = (x - sqrt_ab_t * x0_guided) / sqrt_1m_ab_t
         x_prev = (
             jnp.sqrt(ab_prev) * x0_guided
             + jnp.sqrt(1.0 - ab_prev) * eps_final
@@ -559,6 +578,7 @@ def ppo_value_guided_ddim_sample_theta_v4(
     gamma: float = 0.995,
     gae_lambda: float = 0.95,
     use_positive_value_loss: bool = False,
+    x0_clamp: float = 3.0,
 ) -> jnp.ndarray:
     """End-biased sparse guidance with truncated BPTT (diffV_v4).
 
@@ -732,9 +752,9 @@ def ppo_value_guided_ddim_sample_theta_v4(
                 return scores.sum()
 
             grad_score = jax.grad(gae_score_sum)(x0_pred)
-            eps_guided = eps_clean - sqrt_1m_ab_t * omega * grad_score
-            x0_guided  = (x - sqrt_1m_ab_t * eps_guided) / sqrt_ab_t
-            eps_final  = (x - sqrt_ab_t * x0_guided) / sqrt_1m_ab_t
+            x0_guided = _guided_x0(grad_score, x0_pred, omega, x0_clamp,
+                                   sqrt_1m_ab_t, sqrt_ab_t)
+            eps_final = (x - sqrt_ab_t * x0_guided) / sqrt_1m_ab_t
             x_prev = jnp.sqrt(ab_prev) * x0_guided + jnp.sqrt(1.0 - ab_prev) * eps_final
             return x_prev, rng
 

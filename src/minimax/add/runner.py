@@ -50,6 +50,7 @@ class ADDRunner(DRRunner):
         use_positive_value_loss: bool = False,
         dr_frac: float = 0.5,         # fraction of levels drawn from DR each tick
         dr_max_walls: int = 60,       # DR wall budget: uniform in [0, dr_max_walls]
+        x0_clamp: float = 3.0,        # guidance stabilization: clip x0_guided to [−x0_clamp, x0_clamp]
         unet_kwargs: dict | None = None,
         **kwargs,
     ):
@@ -65,6 +66,7 @@ class ADDRunner(DRRunner):
         # Hybrid DR / diffusion split (resolved once at construction, static at JIT time).
         self._n_dr   = max(0, round(self.n_parallel * dr_frac))
         self._n_diff = self.n_parallel - self._n_dr
+        self.x0_clamp = x0_clamp
 
         with open(diffusion_ckpt_path, "rb") as f:
             ckpt = pickle.load(f)
@@ -131,6 +133,7 @@ class ADDRunner(DRRunner):
             num_steps=self.ddim_steps,
             guidance_rollout_steps=self.guidance_rollout_steps,
             use_positive_value_loss=self.use_positive_value_loss,
+            x0_clamp=self.x0_clamp,
         )
         if self.rollout_every > 1:
             kwargs["rollout_every"] = self.rollout_every
