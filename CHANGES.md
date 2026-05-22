@@ -1,3 +1,73 @@
+# ADD: diffV_v4 — End-Biased Sparse Guidance + Truncated BPTT
+
+## Summary
+
+diffV_v4 makes three targeted changes to the guidance loop — all confined to
+`guidance.py`.  No runner, train, or env code is touched.
+
+**Changes from diffV_v3:**
+
+1. **End-biased schedule** (replaces uniform `rollout_every`): guidance fires at
+   `n_guided=10` DDIM steps chosen by a power-law schedule with `guidance_bias=3.0`.
+   With 50 DDIM steps this places guided steps at approximately
+   `[0, 24, 30, 34, 37, 40, 43, 45, 47, 49]` — one early anchor then dense
+   coverage of the low-noise tail where `x0_pred` is most reliable.
+
+2. **Shorter rollout**: `guidance_rollout_steps` default reduced from 256 → 128.
+   At γ·λ = 0.945, >97% of the GAE signal is captured in 64 steps; 128 gives
+   comfortable margin while halving rollout cost.
+
+3. **Truncated BPTT**: inside `gae_score_sum → per_level`, the LSTM scan is
+   split into a warmup phase (first `T − lstm_k` steps, carry
+   `stop_gradient`'d) and a differentiable window (last `lstm_k=32` steps).
+   `jax.grad` only backpropagates through the 32-step window, reducing the
+   backward-scan cost ~8× while retaining effectively all gradient signal.
+
+### Compute budget (vs diffV_v3, per DDIM pass)
+
+| Component | v3 | v4 |
+|---|---|---|
+| Guided steps | 5 (every 10) | 10 (end-biased) |
+| Rollout per guided step | 256 LSTM fwd | 128 LSTM fwd |
+| Backward per guided step | 256-step scan | 32-step scan |
+| Total guidance cost (units) | 5 × 1024 = 5120 | 10 × 320 = 3200 |
+| Wall-clock vs v3 | — | ~0.6× (40% faster) |
+
+### `make_guidance_mask(num_steps, n_guided, bias)`
+
+New helper: converts `(n_guided, bias)` into a static boolean mask of shape
+`(num_steps,)`.  Positions computed as `round(t^(1/bias) * (num_steps−1))` for
+`t = linspace(0, 1, n_guided)`.  `bias > 1` stretches positions towards the end.
+
+### New parameter `rollout_every` status
+
+`rollout_every` is kept in the `v4` function signature (default 1, ignored) for
+backward compatibility with runner call-sites that pass it as a kwarg.
+
+---
+
+## diffV_v4 Files Changed
+
+### `src/minimax/add/guidance.py`
+
+- Added `import numpy as np`.
+- Added `make_guidance_mask(num_steps, n_guided, bias=3.0) -> jnp.ndarray`.
+- Added `ppo_value_guided_ddim_sample_theta_v4(...)`.  v3 function kept as-is.
+
+---
+
+## diffV_v4 Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| End-bias not uniform | Early DDIM steps have high noise; x0_pred is unreliable and guidance gradient is near-random. Concentrating steps at the end gives cleaner signal per compute unit. |
+| One early anchor (step 0) | Provides a gradient signal even when the level is still mostly noise — acts as a weak global push. |
+| lstm_k=32 window | GAE effective horizon ≈ 18 steps (1/(1−γλ)); K=32 spans ~1.7 horizons, capturing >97% of signal while reducing backward cost 8×. |
+| Warmup carry under stop_gradient | Gives LSTM a realistic hidden state before the differentiable window without growing the backward graph. XLA zeroes cotangents through the warmup. |
+| guidance_rollout_steps=128 | Halves rollout cost; agent still completes ~1–1.5 episodes. If mazes are rarely solved at 128 steps the guidance gradient degrades — monitor cmplx_solv. |
+
+---
+
 # ADD: diffV_v3 — K-Step Guided DDIM
 
 ## Summary

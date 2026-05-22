@@ -27,6 +27,7 @@ from minimax.add.diffusion import make_schedule, diffusion_to_theta
 from minimax.add.guidance import (
     ppo_value_guided_ddim_sample_theta_v2,
     ppo_value_guided_ddim_sample_theta_v3,
+    ppo_value_guided_ddim_sample_theta_v4,
 )
 
 
@@ -84,7 +85,7 @@ class ADDRunner(DRRunner):
             return self.student_pop.agent.model.apply(params, obs, carry, reset)
 
         guidance_fn = (
-            ppo_value_guided_ddim_sample_theta_v3
+            ppo_value_guided_ddim_sample_theta_v4
             if self.rollout_every > 1
             else ppo_value_guided_ddim_sample_theta_v2
         )
