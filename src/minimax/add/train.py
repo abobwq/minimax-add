@@ -65,6 +65,8 @@ def main():
     parser.add_argument("--omega", type=float, default=5.0)
     parser.add_argument("--guidance_rollout_steps", type=int, default=256,
                         help="Rollout length inside each DDIM guidance step")
+    parser.add_argument("--rollout_every", type=int, default=1,
+                        help="Run real rollout every N DDIM steps; 1=diffV_v2, >1=diffV_v3 K-step")
     parser.add_argument("--guidance_ued_score", type=str, default="l1_value_loss",
                         choices=["l1_value_loss", "positive_value_loss"],
                         help="GAE score variant for guidance")
@@ -131,6 +133,7 @@ def main():
         diffusion_ckpt_path=args.diffusion_ckpt,
         ddim_steps=args.ddim_steps,
         guidance_rollout_steps=args.guidance_rollout_steps,
+        rollout_every=args.rollout_every,
         use_positive_value_loss=(args.guidance_ued_score == "positive_value_loss"),
         unet_kwargs=unet_kwargs or None,
         env_name="Maze",

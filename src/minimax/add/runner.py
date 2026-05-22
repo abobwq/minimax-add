@@ -24,7 +24,10 @@ from minimax.envs.maze.common import EnvInstance
 from minimax.add.theta import decode_level
 from minimax.add.unet import UNet
 from minimax.add.diffusion import make_schedule, diffusion_to_theta
-from minimax.add.guidance import ppo_value_guided_ddim_sample_theta_v2
+from minimax.add.guidance import (
+    ppo_value_guided_ddim_sample_theta_v2,
+    ppo_value_guided_ddim_sample_theta_v3,
+)
 
 
 class ADDRunner(DRRunner):
@@ -34,6 +37,7 @@ class ADDRunner(DRRunner):
         diffusion_ckpt_path: str,
         ddim_steps: int = 50,
         guidance_rollout_steps: int = 256,
+        rollout_every: int = 1,       # 1 = every step (diffV_v2 behaviour); >1 = v3 K-step
         use_positive_value_loss: bool = False,
         unet_kwargs: dict | None = None,
         **kwargs,
@@ -44,6 +48,7 @@ class ADDRunner(DRRunner):
         self.schedule = make_schedule()
         self.ddim_steps = ddim_steps
         self.guidance_rollout_steps = guidance_rollout_steps
+        self.rollout_every = rollout_every
         self.use_positive_value_loss = use_positive_value_loss
 
         with open(diffusion_ckpt_path, "rb") as f:
@@ -78,7 +83,12 @@ class ADDRunner(DRRunner):
         def ppo_apply_fn(params, obs, carry, reset):
             return self.student_pop.agent.model.apply(params, obs, carry, reset)
 
-        return ppo_value_guided_ddim_sample_theta_v2(
+        guidance_fn = (
+            ppo_value_guided_ddim_sample_theta_v3
+            if self.rollout_every > 1
+            else ppo_value_guided_ddim_sample_theta_v2
+        )
+        kwargs = dict(
             diff_model_fn=diff_model_fn,
             diff_params=self.diff_params,
             ppo_apply_fn=ppo_apply_fn,
@@ -93,6 +103,9 @@ class ADDRunner(DRRunner):
             guidance_rollout_steps=self.guidance_rollout_steps,
             use_positive_value_loss=self.use_positive_value_loss,
         )
+        if self.rollout_every > 1:
+            kwargs["rollout_every"] = self.rollout_every
+        return guidance_fn(**kwargs)
 
     def _decode_to_instances(self, thetas):
         wall_maps, agent_pos_rc, goal_pos_rc, agent_dirs = jax.vmap(decode_level)(thetas)

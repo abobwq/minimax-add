@@ -1,3 +1,34 @@
+# ADD: diffV_v3 — K-Step Guided DDIM
+
+## Summary
+
+diffV_v3 reduces the per-iteration guidance cost by ~K× while keeping guidance
+faithful.
+
+**Key insight**: diffV_v2 runs a full real rollout + differentiable LSTM scan +
+gradient at *every* DDIM step. The intermediate steps between denoising and the
+final level are different levels — running guidance on all 50 is expensive. Worse,
+running degraded guidance (e.g. zero-carry or stale trajectory) on the in-between
+steps would actively mislead the diffusion process. The clean solution: only guide
+at every K-th step and let DDIM run freely on the rest.
+
+**Changes from diffV_v2:**
+
+1. **K-step guidance**: guided steps fire at DDIM steps 0, K, 2K, … using a full
+   real rollout + differentiable LSTM + gradient. All other steps are plain DDIM
+   — no rollout, no gradient, no guidance at all. With K=10 and 50 DDIM steps,
+   5 guided steps replace 50, giving ~10× reduction in guidance compute.
+
+2. **Higher omega** (default 10.0 vs 5.0): fewer guidance steps means each must
+   push harder.
+
+Implementation uses `jax.lax.cond((i % rollout_every) == 0, guided_step,
+plain_ddim_step, ...)` inside the existing `fori_loop`. Both branches are compiled
+at JIT time; only one executes per step at runtime. The `fori_loop` carry stays
+`(x, rng)` — no cached trajectory needed.
+
+---
+
 # ADD: diffV_v2 — On-Policy GAE Guidance with LSTM Carry
 
 ## Summary
@@ -185,7 +216,7 @@ No changes. `theta_to_soft_maze_map` and `soft_extract_obs` reused as-is.
 | `reset_state=state0` in env step | Reuses codebase's existing auto-reset mechanism; keeps guidance rollout on the same decoded level across episode boundaries. |
 | `diffusion_to_theta` is the only conversion | `x0_pred` and `theta` are identical under linear rescaling; gradient w.r.t. `x0_pred` = gradient w.r.t. `theta` × 0.5. |
 | `--guidance_ued_score` flag | L1 vs positive-only is an open empirical question; CLI arg avoids premature commitment. |
-| No K-step refresh cache | Simpler. Can add later if per-step rollout cost is prohibitive. |
+| No K-step refresh cache in v2 | Simpler baseline. Superseded by diffV_v3's `rollout_every`. |
 | Gradient on `x0_pred`, not `x_t` | Avoids backprop through UNet. Standard classifier guidance practice. |
 
 ---
@@ -196,3 +227,47 @@ No changes. `theta_to_soft_maze_map` and `soft_extract_obs` reused as-is.
 - `src/minimax/add/unet.py`, `diffusion.py`: no changes.
 - `src/minimax/envs/`: no changes to the RL environment.
 - `src/minimax/add/guidance.py` diffV function: kept for ablation comparison.
+
+---
+
+## diffV_v3 Files Changed
+
+### `src/minimax/add/guidance.py`
+
+**Added `ppo_value_guided_ddim_sample_theta_v3()`.**
+diffV_v2 function kept as-is; v3 is a separate function.
+
+New parameter vs v2: `rollout_every: int = 10`.
+
+`fori_loop` body uses `jax.lax.cond((i % rollout_every) == 0, guided_step, plain_ddim_step, (x0_pred, rng))`:
+
+- **`guided_step`**: identical to diffV_v2 body — real rollout → differentiable LSTM scan → `jax.grad` → guidance update.
+- **`plain_ddim_step`**: standard DDIM update with no rollout, no gradient.
+
+Both branches return `(x_prev, rng)`; carry stays `(x, rng)`.
+
+### `src/minimax/add/runner.py`
+
+Added `rollout_every: int = 1` constructor parameter (default 1 = diffV_v2 behaviour).
+`_sample_thetas` dispatches to `ppo_value_guided_ddim_sample_theta_v3` when `rollout_every > 1`,
+otherwise uses v2 as before.
+
+### `src/minimax/add/train.py`
+
+Added `--rollout_every` (int, default 1).
+
+### `run_add_diffv2.sh`
+
+Updated to full training settings: `--n_updates=30000`, `--ddim_steps=50`,
+`--rollout_every=10`, `--omega=10.0`, `--save_every=3000`.
+
+---
+
+## diffV_v3 Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| Plain DDIM on non-guided steps (not cached trajectory) | Degraded guidance (stale trajectory, zero carry) actively misleads the diffusion process — better to run freely than noisily. |
+| `jax.lax.cond` inside `fori_loop` | Both branches compile but only one executes per step; no Python-level loop needed, JIT intact. |
+| `rollout_every=1` default preserves v2 | Zero diff for existing runs; opt-in to v3 by passing `--rollout_every 10`. |
+| omega default raised to 10.0 | Fewer guidance steps means each step must push harder to achieve comparable level steering. |

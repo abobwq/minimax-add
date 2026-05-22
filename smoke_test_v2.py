@@ -447,6 +447,38 @@ def t8():
 
 check(f"T8: full guidance fn (num_steps={DDIM_STEPS}, rollout={ROLLOUT_STEPS})", t8)
 
+# ── T8b: full ppo_value_guided_ddim_sample_theta_v3 (K-step, tiny) ────────────
+def t8b():
+    from minimax.add.guidance import ppo_value_guided_ddim_sample_theta_v3
+
+    def diff_model_fn(params, x, t): return diff_model.apply(params, x, t)
+    def ppo_apply_fn(params, obs, carry, reset): return student_model.apply(params, obs, carry, reset)
+
+    rng_t8b = jax.random.PRNGKey(88)
+    # rollout_every=2 with num_steps=3: guided at step 0 and 2, plain DDIM at step 1
+    thetas = ppo_value_guided_ddim_sample_theta_v3(
+        diff_model_fn       = diff_model_fn,
+        diff_params         = diff_params,
+        ppo_apply_fn        = ppo_apply_fn,
+        ppo_params          = ppo_params,
+        decode_and_reset_fn = decode_and_reset_fn,
+        env_step_fn         = env_step_fn,
+        shape               = (B, 16, 16, 3),
+        rng                 = rng_t8b,
+        schedule            = schedule,
+        omega               = 10.0,
+        num_steps           = DDIM_STEPS,
+        guidance_rollout_steps = ROLLOUT_STEPS,
+        rollout_every       = 2,
+    )
+    assert_shape(thetas, (B, 16, 16, 3), "thetas_v3")
+    assert bool(jnp.all(thetas >= 0.0) and jnp.all(thetas <= 1.0)), \
+        f"thetas not in [0,1]: min={thetas.min():.3f} max={thetas.max():.3f}"
+    assert_finite(thetas, "thetas_v3")
+    print(f"       theta range [{float(thetas.min()):.3f}, {float(thetas.max()):.3f}]", end="")
+
+check(f"T8b: v3 K-step guidance (rollout_every=2, num_steps={DDIM_STEPS})", t8b)
+
 # ── T9: ADDRunner.reset() ──────────────────────────────────────────────────────
 def t9():
     from minimax.add.runner import ADDRunner
@@ -521,7 +553,50 @@ def t10():
     assert thetas_np.shape == (N_PARALLEL, 16, 16, 3), f"thetas shape {thetas_np.shape}"
     print(f"       mean_return={mean_return:.4f}", end="")
 
-check("T10: ADDRunner.run() — one full ADD step", t10)
+check("T10: ADDRunner.run() — one full ADD step (v2)", t10)
+
+# ── T11: ADDRunner.run() with rollout_every=2 (v3) ────────────────────────────
+def t11():
+    from minimax.add.runner import ADDRunner
+    import minimax.agents as agents
+
+    student_agent = agents.PPOAgent(
+        model=student_model, n_epochs=1, n_minibatches=1,
+        clip_eps=0.2, entropy_coef=0.0,
+    )
+    runner = ADDRunner(
+        diffusion_ckpt_path        = CKPT,
+        ddim_steps                 = DDIM_STEPS,
+        guidance_rollout_steps     = ROLLOUT_STEPS,
+        rollout_every              = 2,
+        use_positive_value_loss    = False,
+        env_name                   = "Maze",
+        env_kwargs                 = env_kwargs,
+        student_agents             = [student_agent],
+        n_students                 = 1,
+        n_parallel                 = N_PARALLEL,
+        n_eval                     = 1,
+        n_rollout_steps            = 16,
+        lr                         = 1e-4,
+        discount                   = 0.995,
+        gae_lambda                 = 0.95,
+        track_env_metrics          = False,
+    )
+    rng_r = jax.random.PRNGKey(11)
+    runner_state = runner.reset(rng_r)
+    omega = jnp.array(10.0)
+
+    stats, *runner_state_new = runner.run(*runner_state, omega)
+
+    assert "_mean_return" in stats, "stats missing _mean_return"
+    assert "_thetas"      in stats, "stats missing _thetas"
+    mean_return = float(jax.device_get(stats["_mean_return"]))
+    thetas_np   = np.array(jax.device_get(stats["_thetas"]))
+    assert np.isfinite(mean_return), f"mean_return not finite: {mean_return}"
+    assert thetas_np.shape == (N_PARALLEL, 16, 16, 3), f"thetas shape {thetas_np.shape}"
+    print(f"       mean_return={mean_return:.4f}", end="")
+
+check("T11: ADDRunner.run() — one full ADD step (v3, rollout_every=2)", t11)
 
 # ── summary ────────────────────────────────────────────────────────────────────
 print()
