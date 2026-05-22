@@ -341,3 +341,176 @@ Updated to full training settings: `--n_updates=30000`, `--ddim_steps=50`,
 | `jax.lax.cond` inside `fori_loop` | Both branches compile but only one executes per step; no Python-level loop needed, JIT intact. |
 | `rollout_every=1` default preserves v2 | Zero diff for existing runs; opt-in to v3 by passing `--rollout_every 10`. |
 | omega default raised to 10.0 | Fewer guidance steps means each step must push harder to achieve comparable level steering. |
+
+---
+
+## diffV_v5 — Toggleable Gradient Normalisation + Guidance Stats
+
+## Summary
+
+diffV_v5 adds a single optional flag `--use_grad_norm` that normalises the
+guidance gradient per-level to unit L2 norm before applying ω.  It also
+instruments every guidance step to record the raw gradient magnitude and the
+fraction of x0 elements that were clamped, so these can be monitored in
+training logs.
+
+No architectural changes.  All new code is inside `guidance.py`, `runner.py`,
+and `train.py`.
+
+---
+
+## diffV_v5 Files Changed
+
+### `src/minimax/add/guidance.py`
+
+**`_guided_x0`** now returns a 3-tuple `(x0_guided, raw_gnorm, clamp_frac)` and
+accepts a new static parameter `use_grad_norm: bool = False`:
+
+```python
+def _guided_x0(grad, x0_pred, omega, x0_clamp,
+               sqrt_1m_ab_t, sqrt_ab_t,
+               use_grad_norm: bool = False):
+    B = grad.shape[0]
+    raw_gnorm = jnp.linalg.norm(grad.reshape(B, -1), axis=-1).mean()
+    if use_grad_norm:                          # static branch, resolved at trace time
+        gnorm = jnp.linalg.norm(grad.reshape(B, -1), axis=-1)
+        grad  = grad / (gnorm[:, None, None, None] + 1e-8)
+    step = (sqrt_1m_ab_t ** 2) / sqrt_ab_t
+    x0_unclamped = x0_pred + step * omega * grad
+    x0_guided    = jnp.clip(x0_unclamped, -x0_clamp, x0_clamp)
+    clamp_frac   = jnp.mean(jnp.abs(x0_unclamped) > x0_clamp)
+    return x0_guided, raw_gnorm, clamp_frac
+```
+
+**`ppo_value_guided_ddim_sample_theta_v4`** — `fori_loop` carry extended from
+`(x, rng)` to `(x, rng, gnorm_buf, cfrac_buf)` where both buffers are
+`jnp.zeros(num_steps)`.  The `guided_step` / `plain_ddim_step` branches both
+return `(x_prev, rng, raw_gnorm, clamp_frac)` (plain returns zeros) so that
+`jax.lax.cond` output types match.  Body writes stats via `.at[i].set(val)`.
+Function now returns `(thetas, {"grad_norms": gnorm_buf, "clamp_fracs": cfrac_buf})`.
+
+**`ppo_value_guided_ddim_sample_theta_v2`** — same carry extension; simpler
+since guidance runs at every step (no `jax.lax.cond`).
+
+### `src/minimax/add/runner.py`
+
+Constructor gains `use_grad_norm: bool = False`, stored as `self.use_grad_norm`.
+
+`_sample_thetas` passes `use_grad_norm=self.use_grad_norm`; return type is now
+`(thetas, stats_dict)`.
+
+`sample_levels._sample` returns a 3-tuple `(thetas, instances, stats)` in all
+three branches (diff-only, hybrid, DR-only).  DR-only uses zero-filled stats.
+
+`run()` unpacks the 3-tuple and merges guidance stats into the RL stats dict
+under keys `_diff_grad_norms` and `_diff_clamp_fracs` (student 0 slice).
+
+### `src/minimax/add/train.py`
+
+Added `--use_grad_norm` (store_true, default False).  Passed to `ADDRunner`.
+
+Guidance stats logged every `log_every` updates:
+
+```
+  guidance | grad_norm 0.042 (max 0.187) | clamp 3.2%
+```
+
+---
+
+## diffV_v5 Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| `use_grad_norm` is a Python bool in closure | Resolved at JIT trace time — same pattern as `use_positive_value_loss`. No `jax.lax.cond` needed, zero runtime overhead. |
+| Always compute `raw_gnorm` regardless of flag | Logging costs nothing; we want the raw magnitude even in the unnormalised run to understand the scale. |
+| `+1e-8` epsilon in normalisation denominator | Prevents divide-by-zero on zero-gradient levels (omega=0, or fully converged). |
+| Stats buffer `.at[i].set()` inside `fori_loop` | Standard JAX scatter — fully compatible with XLA. Buffer shape `(num_steps,)` per stat. |
+| Both `cond` branches return same 4-tuple type | `jax.lax.cond` requires identical output pytrees from both branches. Plain DDIM returns `(x_prev, rng, 0.0, 0.0)`. |
+| ω decoupled from gradient magnitude with grad norm | Without normalisation, ω and gradient scale are entangled — a harder level produces a larger raw gradient and a larger step. With normalisation, ω is a pure step size in normalised-direction space. Tradeoff: loses the natural self-regulation where the gradient shrinks as the level converges. |
+
+---
+
+## diffV_v5b — Fix Vanishing Guidance Step (x_t Perturbation)
+
+## Summary
+
+Empirical observation from the grad-norm sweep (ω=0.1 → 0.4% clamp, ω=250 → 1.0%
+clamp) revealed that the 2500× ω increase produced only a 2.5× increase in clamp
+fraction — ω was nearly irrelevant.
+
+Root cause: the guidance step formula `(1−ᾱ_t)/√ᾱ_t` → 0 at end-biased late DDIM
+steps (ᾱ_t → 1).  End-biased schedule and the ε-space scale factor conspire: the
+schedule fires guidance exactly where the scale is smallest.
+
+---
+
+## Mathematical basis
+
+**What the original formula derived from:**
+
+The original `guided_ddim_sample` (EnvCritic) follows standard DDPM classifier
+guidance (Dhariwal & Nichol 2021): it computes `∇_{x_t}` directly and modifies ε:
+
+```
+ε_guided = ε_clean − √(1−ᾱ) · ω · ∇_{x_t} f
+⟹ x0_guided = x0_pred + (1−ᾱ)/√ᾱ · ω · ∇_{x_t} f
+```
+
+When v2/v4 switched to computing `∇_{x0_pred} f` (necessary because the guidance
+score runs on decoded levels, not x_t), the same scale factor was kept.  The correct
+Jacobian-adjusted standard formula for a gradient computed w.r.t. x0_pred would give
+`(1−ᾱ)/ᾱ`, not `(1−ᾱ)/√ᾱ`.  Both factors vanish at late steps.
+
+**The fix — direct x_t perturbation:**
+
+Derivation — we never actually modify x_t.  The x_t perturbation is a thought
+experiment that tells us what step size to use on x0_pred.
+
+DDIM relates x_t and x0_pred (treating ε_θ as constant w.r.t. the perturbation,
+standard classifier-guidance assumption):
+
+```
+x0_pred = (x_t − √(1−ᾱ_t) · ε_θ) / √ᾱ_t
+```
+
+Hypothetically perturb x_t by ω · grad_normalised:
+
+```
+x_t' = x_t + ω · grad_normalised
+```
+
+Substitute into the DDIM formula to find the implied x0_pred:
+
+```
+x0_guided = (x_t' − √(1−ᾱ_t) · ε_θ) / √ᾱ_t
+           = (x_t + ω · grad_normalised − √(1−ᾱ_t) · ε_θ) / √ᾱ_t
+           = (x_t − √(1−ᾱ_t) · ε_θ) / √ᾱ_t  +  ω · grad_normalised / √ᾱ_t
+           = x0_pred  +  ω · grad_normalised / √ᾱ_t
+```
+
+Only this last line is implemented — x0_pred is shifted directly, x_t is never
+touched.  The result: `step = 1/√ᾱ_t`.
+
+At end-biased late steps √ᾱ_t ≈ 1, so step ≈ 1 and ω is a direct step size in
+x0_pred space.  The formula does not vanish.
+
+---
+
+## diffV_v5b Files Changed
+
+### `src/minimax/add/guidance.py`
+
+**`_guided_x0`**: signature drops `sqrt_1m_ab_t` (no longer used in step
+computation); step changes from `(sqrt_1m_ab_t**2)/sqrt_ab_t` to
+`1.0/sqrt_ab_t`. Call sites in v2 and v4 bodies updated accordingly.
+
+---
+
+## diffV_v5b Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| `step = 1/√ᾱ_t` not `step = 1.0` | `1/√ᾱ_t` is the principled Jacobian correction for "unit step in x_t space." At end-biased late steps it equals ≈1 anyway. Choosing `1/√ᾱ_t` keeps the derivation correct if the schedule is ever changed to non-end-biased. |
+| Keep end-biased schedule unchanged | End-biased fires at low-noise steps where x0_pred is a clean, reliable level prediction. The vanishing was due to the scale formula, not the schedule choice. |
+| Keep rollout timing unchanged | Rollout frequency (rollout_every / n_guided) is independent of the guidance scale formula. |
+| Drop `sqrt_1m_ab_t` from `_guided_x0` | The parameter was only used in the old step formula. Removing it prevents confusion and makes the new derivation self-evident from the signature. |

@@ -78,8 +78,11 @@ def main():
     parser.add_argument("--dr_max_walls", type=int, default=60,
                         help="DR wall budget: n_walls sampled uniform in [0, dr_max_walls]")
     parser.add_argument("--x0_clamp", type=float, default=3.0,
-                        help="Guidance stabilization: clip x0_guided to [-x0_clamp, x0_clamp] "
-                             "after normalized gradient step. Set to 100 to ablate.")
+                        help="Guidance stabilization: clip x0_guided to [-x0_clamp, x0_clamp]. "
+                             "Set to 100 to ablate.")
+    parser.add_argument("--use_grad_norm", action="store_true", default=False,
+                        help="Normalize guidance gradient per-level to unit L2 norm before "
+                             "applying omega. Makes omega a step-size in normalised-direction space.")
 
     parser.add_argument("--n_parallel", type=int, default=32)
     parser.add_argument("--rollout_steps", type=int, default=256)
@@ -145,6 +148,7 @@ def main():
         dr_frac=args.dr_frac,
         dr_max_walls=args.dr_max_walls,
         x0_clamp=args.x0_clamp,
+        use_grad_norm=args.use_grad_norm,
         unet_kwargs=unet_kwargs or None,
         env_name="Maze",
         env_kwargs=env_kwargs,
@@ -222,6 +226,17 @@ def main():
                     ppo_parts.append(f"{label}={float(stats_cpu[key]):{fmt}}")
             if ppo_parts:
                 print(f"  ppo  | {' | '.join(ppo_parts)}")
+
+            # Guidance stats (grad norms + clamp fraction)
+            gnorms = np.array(jax.device_get(stats["_diff_grad_norms"]))
+            cfracs = np.array(jax.device_get(stats["_diff_clamp_fracs"]))
+            guided_steps = gnorms > 0
+            if guided_steps.any():
+                print(
+                    f"  guidance | grad_norm {gnorms[guided_steps].mean():.3f}"
+                    f" (max {gnorms[guided_steps].max():.3f})"
+                    f" | clamp {cfracs[guided_steps].mean():.1%}"
+                )
 
             # Level complexity on the most recent batch of generated levels
             n_walls, path_lens = compute_complexity_metrics(jnp.array(thetas_np))

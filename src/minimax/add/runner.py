@@ -51,6 +51,7 @@ class ADDRunner(DRRunner):
         dr_frac: float = 0.5,         # fraction of levels drawn from DR each tick
         dr_max_walls: int = 60,       # DR wall budget: uniform in [0, dr_max_walls]
         x0_clamp: float = 3.0,        # guidance stabilization: clip x0_guided to [−x0_clamp, x0_clamp]
+        use_grad_norm: bool = False,  # normalize guidance gradient per-level to unit L2
         unet_kwargs: dict | None = None,
         **kwargs,
     ):
@@ -67,6 +68,7 @@ class ADDRunner(DRRunner):
         self._n_dr   = max(0, round(self.n_parallel * dr_frac))
         self._n_diff = self.n_parallel - self._n_dr
         self.x0_clamp = x0_clamp
+        self.use_grad_norm = use_grad_norm
 
         with open(diffusion_ckpt_path, "rb") as f:
             ckpt = pickle.load(f)
@@ -134,10 +136,11 @@ class ADDRunner(DRRunner):
             guidance_rollout_steps=self.guidance_rollout_steps,
             use_positive_value_loss=self.use_positive_value_loss,
             x0_clamp=self.x0_clamp,
+            use_grad_norm=self.use_grad_norm,
         )
         if self.rollout_every > 1:
             kwargs["rollout_every"] = self.rollout_every
-        return guidance_fn(**kwargs)
+        return guidance_fn(**kwargs)  # returns (thetas, stats)
 
     def _sample_dr_instances(self, rng, n_levels):
         """Sample n_levels random maze instances via plain env reset (no diffusion)."""
@@ -172,6 +175,11 @@ class ADDRunner(DRRunner):
         """Hybrid level sampling: n_diff guided DDIM + n_dr random DR per student."""
         rng, *student_rngs = jax.random.split(rng, self.n_students + 1)
 
+        _zero_stats = {
+            "grad_norms":  jnp.zeros(self.ddim_steps),
+            "clamp_fracs": jnp.zeros(self.ddim_steps),
+        }
+
         # _n_diff / _n_dr are Python ints — branches resolved at trace time.
         def _sample(rng):
             rng, diff_rng, dr_rng = jax.random.split(rng, 3)
@@ -179,7 +187,7 @@ class ADDRunner(DRRunner):
             # DR dummy thetas are 16×16 to match diffusion theta space.
             _THETA_HW = 16
             if self._n_diff > 0 and self._n_dr > 0:
-                diff_thetas = self._sample_thetas(diff_rng, self._n_diff, ppo_params_s0, omega)
+                diff_thetas, stats = self._sample_thetas(diff_rng, self._n_diff, ppo_params_s0, omega)
                 diff_inst   = self._decode_to_instances(diff_thetas)
                 dr_inst     = self._sample_dr_instances(dr_rng, self._n_dr)
                 dr_thetas   = jnp.zeros((self._n_dr, _THETA_HW, _THETA_HW, 3))
@@ -189,13 +197,14 @@ class ADDRunner(DRRunner):
                     diff_inst, dr_inst,
                 )
             elif self._n_dr == 0:
-                thetas    = self._sample_thetas(diff_rng, self._n_diff, ppo_params_s0, omega)
+                thetas, stats = self._sample_thetas(diff_rng, self._n_diff, ppo_params_s0, omega)
                 instances = self._decode_to_instances(thetas)
             else:
                 instances = self._sample_dr_instances(dr_rng, self._n_dr)
                 thetas    = jnp.zeros((self._n_dr, _THETA_HW, _THETA_HW, 3))
+                stats     = _zero_stats
 
-            return thetas, instances
+            return thetas, instances, stats
 
         return jax.vmap(_sample)(jnp.array(student_rngs))
 
@@ -301,7 +310,7 @@ class ADDRunner(DRRunner):
         ppo_params_s0 = jax.tree.map(lambda p: p[0], train_state.params)
 
         rng, sample_rng = jax.random.split(rng)
-        all_thetas, all_instances = self.sample_levels(
+        all_thetas, all_instances, diff_stats = self.sample_levels(
             sample_rng, ppo_params_s0, omega
         )
 
@@ -310,4 +319,9 @@ class ADDRunner(DRRunner):
             all_thetas, all_instances,
         )
         self.n_updates += 1
-        return result
+
+        # Merge guidance stats (student 0) into the rl stats dict.
+        stats_dict, *rest = result
+        stats_dict["_diff_grad_norms"]  = diff_stats["grad_norms"][0]
+        stats_dict["_diff_clamp_fracs"] = diff_stats["clamp_fracs"][0]
+        return (stats_dict, *rest)

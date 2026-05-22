@@ -33,21 +33,41 @@ ModelFn = Callable  # (params, x_t, t_batch) -> output
 
 def _guided_x0(grad: jnp.ndarray, x0_pred: jnp.ndarray,
                omega: float, x0_clamp: float,
-               sqrt_1m_ab_t: jnp.ndarray,
-               sqrt_ab_t: jnp.ndarray) -> jnp.ndarray:
-    """Apply raw gradient guidance and return clamped x0_guided.
+               sqrt_ab_t: jnp.ndarray,
+               use_grad_norm: bool = False):
+    """Apply gradient guidance, return (x0_guided, raw_gnorm, clamp_frac).
 
-    No grad normalization — omega is calibrated against the raw gradient
-    magnitude, matching the original v3 behaviour.  x0_clamp prevents
-    runaway into OOD territory for the UNet (trained on x0 ∈ [-1, 1]).
+    raw_gnorm: mean per-level L2 of the raw gradient before any normalization.
+    clamp_frac: fraction of elements where |x0_unclamped| > x0_clamp.
 
-    Formula (algebra of the eps detour):
-        x0_guided = x0_pred + (1-ᾱ)/√ᾱ · ω · grad
-                  = x0_pred + (sqrt_1m_ab_t² / sqrt_ab_t) · ω · grad
+    Step derivation: treat guidance as a direct x_t perturbation in the
+    normalised-gradient direction, then propagate to x0_pred via the DDIM
+    Jacobian (∂x0_pred/∂x_t = 1/√ᾱ_t):
+
+        x_t_guided  = x_t + ω · grad_normalised          (unit step in x_t space)
+        x0_guided   = x0_pred + ω · grad_normalised / √ᾱ_t
+        ⟹  step    = 1 / √ᾱ_t
+
+    At end-biased late DDIM steps √ᾱ_t ≈ 1, so step ≈ 1 and ω is a direct
+    step size in x0_pred space.  This avoids the vanishing of the original
+    ε-space formula (1−ᾱ)/√ᾱ → 0 at late steps.
+
+    use_grad_norm normalizes per-level to unit L2 before applying omega,
+    making omega a step-size in normalised-gradient-direction space.
+    It is a Python bool resolved at trace time — no JAX conditional.
     """
-    step = (sqrt_1m_ab_t ** 2) / sqrt_ab_t   # (1-ᾱ)/√ᾱ, scalar
-    x0_guided = x0_pred + step * omega * grad
-    return jnp.clip(x0_guided, -x0_clamp, x0_clamp)
+    B = grad.shape[0]
+    raw_gnorm = jnp.linalg.norm(grad.reshape(B, -1), axis=-1).mean()
+
+    if use_grad_norm:
+        gnorm = jnp.linalg.norm(grad.reshape(B, -1), axis=-1)
+        grad  = grad / (gnorm[:, None, None, None] + 1e-8)
+
+    step = 1.0 / sqrt_ab_t
+    x0_unclamped = x0_pred + step * omega * grad
+    x0_guided    = jnp.clip(x0_unclamped, -x0_clamp, x0_clamp)
+    clamp_frac   = jnp.mean(jnp.abs(x0_unclamped) > x0_clamp)
+    return x0_guided, raw_gnorm, clamp_frac
 
 
 def guided_ddim_sample(
@@ -362,8 +382,13 @@ def ppo_value_guided_ddim_sample_theta_v2(
     gae_lambda: float = 0.95,
     use_positive_value_loss: bool = False,
     x0_clamp: float = 3.0,
-) -> jnp.ndarray:
+    use_grad_norm: bool = False,
+) -> tuple:
     """On-policy PPO-value GAE guided DDIM sampling (diffV_v2).
+
+    Returns (thetas, stats) where stats = {"grad_norms": (num_steps,), "clamp_fracs": (num_steps,)}.
+    grad_norms[i]: mean per-level raw gradient L2 at DDIM step i.
+    clamp_fracs[i]: fraction of elements clamped at DDIM step i.
 
     At each DDIM step:
       1. Hard-decode x0_pred → run a real rollout on that level (stop_gradient).
@@ -384,7 +409,7 @@ def ppo_value_guided_ddim_sample_theta_v2(
     x = jax.random.normal(rng, shape)
 
     def body(i, carry):
-        x, rng = carry
+        x, rng, gnorm_buf, cfrac_buf = carry
         t_cur  = timesteps[i]
         t_prev = jnp.where(i < num_steps - 1, timesteps[i + 1], -1)
 
@@ -524,17 +549,23 @@ def ppo_value_guided_ddim_sample_theta_v2(
 
         grad_score = jax.grad(gae_score_sum)(x0_pred)
 
-        x0_guided = _guided_x0(grad_score, x0_pred, omega, x0_clamp,
-                                sqrt_1m_ab_t, sqrt_ab_t)
+        x0_guided, raw_gnorm, clamp_frac = _guided_x0(
+            grad_score, x0_pred, omega, x0_clamp,
+            sqrt_ab_t, use_grad_norm,
+        )
         eps_final = (x - sqrt_ab_t * x0_guided) / sqrt_1m_ab_t
         x_prev = (
             jnp.sqrt(ab_prev) * x0_guided
             + jnp.sqrt(1.0 - ab_prev) * eps_final
         )
-        return x_prev, rng
+        gnorm_buf = gnorm_buf.at[i].set(raw_gnorm)
+        cfrac_buf = cfrac_buf.at[i].set(clamp_frac)
+        return x_prev, rng, gnorm_buf, cfrac_buf
 
-    (x, _) = jax.lax.fori_loop(0, num_steps, body, (x, rng))
-    return jnp.clip(diffusion_to_theta(x), 0.0, 1.0)
+    init_carry = (x, rng, jnp.zeros(num_steps), jnp.zeros(num_steps))
+    (x, _, gnorm_buf, cfrac_buf) = jax.lax.fori_loop(0, num_steps, body, init_carry)
+    stats = {"grad_norms": gnorm_buf, "clamp_fracs": cfrac_buf}
+    return jnp.clip(diffusion_to_theta(x), 0.0, 1.0), stats
 
 
 # ── diffV_v4 helpers ──────────────────────────────────────────────────────────
@@ -579,8 +610,13 @@ def ppo_value_guided_ddim_sample_theta_v4(
     gae_lambda: float = 0.95,
     use_positive_value_loss: bool = False,
     x0_clamp: float = 3.0,
-) -> jnp.ndarray:
+    use_grad_norm: bool = False,
+) -> tuple:
     """End-biased sparse guidance with truncated BPTT (diffV_v4).
+
+    Returns (thetas, stats) where stats = {"grad_norms": (num_steps,), "clamp_fracs": (num_steps,)}.
+    grad_norms[i]: mean per-level raw gradient L2 at guided DDIM step i (0 at plain steps).
+    clamp_fracs[i]: fraction of elements clamped (0 at plain steps).
 
     Three changes from v3:
       1. End-biased schedule: n_guided=10 steps placed with power-law bias
@@ -603,7 +639,7 @@ def ppo_value_guided_ddim_sample_theta_v4(
     warmup_steps  = max(guidance_rollout_steps - lstm_k, 0)
 
     def body(i, carry):
-        x, rng = carry
+        x, rng, gnorm_buf, cfrac_buf = carry
 
         t_cur  = timesteps[i]
         t_prev = jnp.where(i < num_steps - 1, timesteps[i + 1], -1)
@@ -752,28 +788,34 @@ def ppo_value_guided_ddim_sample_theta_v4(
                 return scores.sum()
 
             grad_score = jax.grad(gae_score_sum)(x0_pred)
-            x0_guided = _guided_x0(grad_score, x0_pred, omega, x0_clamp,
-                                   sqrt_1m_ab_t, sqrt_ab_t)
+            x0_guided, raw_gnorm, clamp_frac = _guided_x0(
+                grad_score, x0_pred, omega, x0_clamp,
+                sqrt_ab_t, use_grad_norm,
+            )
             eps_final = (x - sqrt_ab_t * x0_guided) / sqrt_1m_ab_t
             x_prev = jnp.sqrt(ab_prev) * x0_guided + jnp.sqrt(1.0 - ab_prev) * eps_final
-            return x_prev, rng
+            return x_prev, rng, raw_gnorm, clamp_frac
 
         # ── plain DDIM branch ────────────────────────────────────────────────
         def plain_ddim_step(args):
             x0_pred, rng = args
             x_prev = jnp.sqrt(ab_prev) * x0_pred + jnp.sqrt(1.0 - ab_prev) * eps_clean
-            return x_prev, rng
+            return x_prev, rng, jnp.float32(0.0), jnp.float32(0.0)
 
-        x_prev, rng = jax.lax.cond(
+        x_prev, rng, raw_gnorm, clamp_frac = jax.lax.cond(
             guidance_mask[i],
             guided_step,
             plain_ddim_step,
             (x0_pred, rng),
         )
-        return x_prev, rng
+        gnorm_buf = gnorm_buf.at[i].set(raw_gnorm)
+        cfrac_buf = cfrac_buf.at[i].set(clamp_frac)
+        return x_prev, rng, gnorm_buf, cfrac_buf
 
-    (x, _) = jax.lax.fori_loop(0, num_steps, body, (x, rng))
-    return jnp.clip(diffusion_to_theta(x), 0.0, 1.0)
+    init_carry = (x, rng, jnp.zeros(num_steps), jnp.zeros(num_steps))
+    (x, _, gnorm_buf, cfrac_buf) = jax.lax.fori_loop(0, num_steps, body, init_carry)
+    stats = {"grad_norms": gnorm_buf, "clamp_fracs": cfrac_buf}
+    return jnp.clip(diffusion_to_theta(x), 0.0, 1.0), stats
 
 
 def ppo_value_guided_ddim_sample_theta_v3(
