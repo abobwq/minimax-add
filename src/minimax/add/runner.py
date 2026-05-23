@@ -28,6 +28,7 @@ import jax.numpy as jnp
 from minimax.runners.dr_runner import DRRunner
 from minimax.envs.maze.common import EnvInstance
 from minimax.envs.maze.maze import Maze
+import minimax.util.graph as graph_util
 
 from minimax.add.theta import decode_level
 from minimax.add.unet import UNet
@@ -52,6 +53,7 @@ class ADDRunner(DRRunner):
         dr_max_walls: int = 60,       # DR wall budget: uniform in [0, dr_max_walls]
         x0_clamp: float = 3.0,        # guidance stabilization: clip x0_guided to [−x0_clamp, x0_clamp]
         use_grad_norm: bool = False,  # normalize guidance gradient per-level to unit L2
+        grad_compress_p: float = 1.0,  # power compression exponent before normalization (1=off)
         unet_kwargs: dict | None = None,
         **kwargs,
     ):
@@ -64,11 +66,10 @@ class ADDRunner(DRRunner):
         self.rollout_every = rollout_every
         self.use_positive_value_loss = use_positive_value_loss
 
-        # Hybrid DR / diffusion split (resolved once at construction, static at JIT time).
-        self._n_dr   = max(0, round(self.n_parallel * dr_frac))
-        self._n_diff = self.n_parallel - self._n_dr
+        self.dr_frac  = dr_frac
         self.x0_clamp = x0_clamp
         self.use_grad_norm = use_grad_norm
+        self.grad_compress_p = grad_compress_p
 
         with open(diffusion_ckpt_path, "rb") as f:
             ckpt = pickle.load(f)
@@ -81,7 +82,7 @@ class ADDRunner(DRRunner):
         self._env_step_fn         = jax.vmap(self.benv.env.step)
 
         # Bare maze env used only for DR resets (no wrappers, no agent).
-        if self._n_dr > 0:
+        if dr_frac > 0:
             ep = self.env.params
             self._dr_env = Maze(
                 height=ep.height,
@@ -137,6 +138,7 @@ class ADDRunner(DRRunner):
             use_positive_value_loss=self.use_positive_value_loss,
             x0_clamp=self.x0_clamp,
             use_grad_norm=self.use_grad_norm,
+            grad_compress_p=self.grad_compress_p,
         )
         if self.rollout_every > 1:
             kwargs["rollout_every"] = self.rollout_every
@@ -170,40 +172,27 @@ class ADDRunner(DRRunner):
         )
         return jax.vmap(self.benv.env.set_env_instance)(instances_repeated)
 
-    @partial(jax.jit, static_argnums=(0,))
-    def sample_levels(self, rng, ppo_params_s0, omega):
-        """Hybrid level sampling: n_diff guided DDIM + n_dr random DR per student."""
+    @partial(jax.jit, static_argnums=(0, 4))
+    def sample_levels(self, rng, ppo_params_s0, omega, use_dr: bool):
+        """Per-update level sampling: all guided DDIM or all DR (decided before call)."""
         rng, *student_rngs = jax.random.split(rng, self.n_students + 1)
 
         _zero_stats = {
             "grad_norms":  jnp.zeros(self.ddim_steps),
             "clamp_fracs": jnp.zeros(self.ddim_steps),
+            "eff_ks":      jnp.zeros(self.ddim_steps),
         }
 
-        # _n_diff / _n_dr are Python ints — branches resolved at trace time.
+        # use_dr is a Python bool (static) — branch resolved at trace time.
         def _sample(rng):
             rng, diff_rng, dr_rng = jax.random.split(rng, 3)
-
-            # DR dummy thetas are 16×16 to match diffusion theta space.
-            _THETA_HW = 16
-            if self._n_diff > 0 and self._n_dr > 0:
-                diff_thetas, stats = self._sample_thetas(diff_rng, self._n_diff, ppo_params_s0, omega)
-                diff_inst   = self._decode_to_instances(diff_thetas)
-                dr_inst     = self._sample_dr_instances(dr_rng, self._n_dr)
-                dr_thetas   = jnp.zeros((self._n_dr, _THETA_HW, _THETA_HW, 3))
-                thetas    = jnp.concatenate([diff_thetas, dr_thetas], axis=0)
-                instances = jax.tree.map(
-                    lambda a, b: jnp.concatenate([a, b], axis=0),
-                    diff_inst, dr_inst,
-                )
-            elif self._n_dr == 0:
-                thetas, stats = self._sample_thetas(diff_rng, self._n_diff, ppo_params_s0, omega)
-                instances = self._decode_to_instances(thetas)
-            else:
-                instances = self._sample_dr_instances(dr_rng, self._n_dr)
-                thetas    = jnp.zeros((self._n_dr, _THETA_HW, _THETA_HW, 3))
+            if use_dr:
+                instances = self._sample_dr_instances(dr_rng, self.n_parallel)
+                thetas    = jnp.zeros((self.n_parallel, 16, 16, 3))
                 stats     = _zero_stats
-
+            else:
+                thetas, stats = self._sample_thetas(diff_rng, self.n_parallel, ppo_params_s0, omega)
+                instances = self._decode_to_instances(thetas)
             return thetas, instances, stats
 
         return jax.vmap(_sample)(jnp.array(student_rngs))
@@ -212,7 +201,7 @@ class ADDRunner(DRRunner):
     # RL rollout + PPO update
     # ------------------------------------------------------------------
 
-    @partial(jax.jit, static_argnums=(0,))
+    @partial(jax.jit, static_argnums=(0, 11))
     def _run_rl(
         self,
         rng,
@@ -225,6 +214,7 @@ class ADDRunner(DRRunner):
         ep_stats,
         all_thetas,
         all_instances,
+        use_dr: bool,
     ):
         rollout_batch_shape = (self.n_students, self.n_parallel * self.n_eval)
 
@@ -265,7 +255,17 @@ class ADDRunner(DRRunner):
         stats = self._compile_stats(update_stats, ep_stats, env_metrics)
         stats.update(dict(n_updates=train_state.n_updates[0]))
 
-        stats["_thetas"] = all_thetas[0]
+        if use_dr:
+            # DR update: log solvability from real instances (not thetas)
+            dr_wm  = all_instances.wall_map[0]
+            dr_ap  = all_instances.agent_pos[0]
+            dr_gp  = all_instances.goal_pos[0]
+            dr_pls = jax.vmap(graph_util.shortest_path_len)(dr_wm, dr_ap, dr_gp)
+            stats["_dr_n_solv"]  = (dr_pls > 0).sum()
+            stats["_dr_n_walls"] = dr_wm.sum(axis=(-1, -2)).mean()
+            stats["_thetas"]     = jnp.zeros((0, 16, 16, 3))  # empty → skip complexity log
+        else:
+            stats["_thetas"] = all_thetas[0]
 
         rewards_s0 = rollout["rewards"][0]
         dones_s0   = rollout["dones"][0]
@@ -309,14 +309,15 @@ class ADDRunner(DRRunner):
 
         ppo_params_s0 = jax.tree.map(lambda p: p[0], train_state.params)
 
-        rng, sample_rng = jax.random.split(rng)
+        rng, dr_rng, sample_rng = jax.random.split(rng, 3)
+        use_dr = self.dr_frac > 0 and bool(jax.random.bernoulli(dr_rng, self.dr_frac))
         all_thetas, all_instances, diff_stats = self.sample_levels(
-            sample_rng, ppo_params_s0, omega
+            sample_rng, ppo_params_s0, omega, use_dr
         )
 
         result = self._run_rl(
             rng, train_state, state, start_state, obs, carry, extra, ep_stats,
-            all_thetas, all_instances,
+            all_thetas, all_instances, use_dr
         )
         self.n_updates += 1
 
@@ -324,4 +325,5 @@ class ADDRunner(DRRunner):
         stats_dict, *rest = result
         stats_dict["_diff_grad_norms"]  = diff_stats["grad_norms"][0]
         stats_dict["_diff_clamp_fracs"] = diff_stats["clamp_fracs"][0]
+        stats_dict["_diff_grad_eff_ks"] = diff_stats["eff_ks"][0]
         return (stats_dict, *rest)

@@ -83,6 +83,10 @@ def main():
     parser.add_argument("--use_grad_norm", action="store_true", default=False,
                         help="Normalize guidance gradient per-level to unit L2 norm before "
                              "applying omega. Makes omega a step-size in normalised-direction space.")
+    parser.add_argument("--grad_compress_p", type=float, default=1.0,
+                        help="Power compression exponent: grad = sign(g)|g|^(1/p) before L2 "
+                             "normalization. p=1 is identity; p=3 equalizes path-1/2 spikes vs "
+                             "path-3 signal. Only effective when --use_grad_norm is set.")
 
     parser.add_argument("--n_parallel", type=int, default=32)
     parser.add_argument("--rollout_steps", type=int, default=256)
@@ -100,10 +104,17 @@ def main():
     parser.add_argument("--save_every", type=int, default=1000)
     parser.add_argument("--eval_episodes", type=int, default=10)
     parser.add_argument("--ckpt_dir", type=str, default="checkpoints/rl")
+    parser.add_argument("--run_name", type=str, default=None,
+                        help="Subdirectory name inside ckpt_dir for this run. "
+                             "Defaults to add_s{seed}. Set per-run to avoid checkpoint collisions.")
+    parser.add_argument("--resume_ckpt", type=str, default=None,
+                        help="Path to a .pkl checkpoint to warm-start PPO params from. "
+                             "Optimizer state resets; tick/train_steps continue from saved values.")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    ckpt_dir = os.path.join(args.ckpt_dir, f"add_s{args.seed}")
+    run_name = args.run_name if args.run_name else f"add_s{args.seed}"
+    ckpt_dir = os.path.join(args.ckpt_dir, run_name)
     os.makedirs(ckpt_dir, exist_ok=True)
 
     steps_per_update = args.n_parallel * args.rollout_steps
@@ -149,6 +160,7 @@ def main():
         dr_max_walls=args.dr_max_walls,
         x0_clamp=args.x0_clamp,
         use_grad_norm=args.use_grad_norm,
+        grad_compress_p=args.grad_compress_p,
         unet_kwargs=unet_kwargs or None,
         env_name="Maze",
         env_kwargs=env_kwargs,
@@ -187,6 +199,16 @@ def main():
     t0 = time.time()
     tick = 0
     train_steps = 0
+
+    if args.resume_ckpt:
+        with open(args.resume_ckpt, "rb") as f:
+            ckpt = pickle.load(f)
+        saved_params = jax.device_put(ckpt["rl_params"])
+        train_state = runner_state[1].replace(params=saved_params)
+        runner_state = (runner_state[0], train_state, *runner_state[2:])
+        tick        = ckpt["tick"]
+        train_steps = ckpt["train_steps"]
+        print(f"  resumed from {args.resume_ckpt} at tick={tick}, steps={train_steps:,}")
 
     while tick < args.n_updates:
         rng, _ = jax.random.split(rng)
@@ -227,27 +249,35 @@ def main():
             if ppo_parts:
                 print(f"  ppo  | {' | '.join(ppo_parts)}")
 
-            # Guidance stats (grad norms + clamp fraction)
-            gnorms = np.array(jax.device_get(stats["_diff_grad_norms"]))
-            cfracs = np.array(jax.device_get(stats["_diff_clamp_fracs"]))
+            # Guidance stats (grad norms + clamp fraction + effective active elements)
+            gnorms  = np.array(jax.device_get(stats["_diff_grad_norms"]))
+            cfracs  = np.array(jax.device_get(stats["_diff_clamp_fracs"]))
+            effks   = np.array(jax.device_get(stats["_diff_grad_eff_ks"]))
             guided_steps = gnorms > 0
             if guided_steps.any():
                 print(
                     f"  guidance | grad_norm {gnorms[guided_steps].mean():.3f}"
                     f" (max {gnorms[guided_steps].max():.3f})"
                     f" | clamp {cfracs[guided_steps].mean():.1%}"
+                    f" | eff_k {effks[guided_steps].mean():.1f}/768"
                 )
 
-            # Level complexity on the most recent batch of generated levels
-            n_walls, path_lens = compute_complexity_metrics(jnp.array(thetas_np))
-            solvable = path_lens > 0
-            n_solv = int(solvable.sum())
-            path_solv = path_lens[solvable]
-            pl_str = f"{float(path_solv.mean()):.1f}±{float(path_solv.std()):.1f}" if n_solv > 0 else "n/a"
-            print(
-                f"  level| walls {float(n_walls.mean()):.1f}±{float(n_walls.std()):.1f} | "
-                f"path {pl_str} | solv {n_solv}/{len(n_walls)}"
-            )
+            # Level complexity — diffusion levels only (empty when DR update)
+            if thetas_np.shape[0] > 0:
+                n_walls, path_lens = compute_complexity_metrics(jnp.array(thetas_np))
+                solvable = path_lens > 0
+                n_solv = int(solvable.sum())
+                path_solv = path_lens[solvable]
+                pl_str = f"{float(path_solv.mean()):.1f}±{float(path_solv.std()):.1f}" if n_solv > 0 else "n/a"
+                print(
+                    f"  level| walls {float(n_walls.mean()):.1f}±{float(n_walls.std()):.1f} | "
+                    f"path {pl_str} | solv {n_solv}/{len(n_walls)}"
+                )
+            if "_dr_n_solv" in stats_cpu:
+                print(
+                    f"  dr   | walls {float(stats_cpu['_dr_n_walls']):.1f} | "
+                    f"solv {int(stats_cpu['_dr_n_solv'])}/{args.n_parallel}"
+                )
 
         if (tick + 1) % args.eval_every == 0:
             rng, rng_eval = jax.random.split(rng)
@@ -267,12 +297,18 @@ def main():
                     print(f"    {name}: {rate:.1%}")
 
             # Complexity logged at eval too (fuller path length summary)
-            n_walls, path_lens = compute_complexity_metrics(jnp.array(thetas_np))
-            solvable = path_lens > 0
-            n_solv = int(solvable.sum())
-            path_solv = path_lens[solvable]
-            pl_str = f"{float(path_solv.mean()):.1f}" if n_solv > 0 else "n/a"
-            print(f"  complexity | walls {float(n_walls.mean()):.1f}±{float(n_walls.std()):.1f} | path {pl_str} | solv {n_solv}/{len(n_walls)}")
+            if thetas_np.shape[0] > 0:
+                n_walls, path_lens = compute_complexity_metrics(jnp.array(thetas_np))
+                solvable = path_lens > 0
+                n_solv = int(solvable.sum())
+                path_solv = path_lens[solvable]
+                pl_str = f"{float(path_solv.mean()):.1f}" if n_solv > 0 else "n/a"
+                print(f"  complexity | walls {float(n_walls.mean()):.1f}±{float(n_walls.std()):.1f} | path {pl_str} | solv {n_solv}/{len(n_walls)}")
+            if "_dr_n_solv" in stats_cpu:
+                print(
+                    f"  dr   | walls {float(stats_cpu['_dr_n_walls']):.1f} | "
+                    f"solv {int(stats_cpu['_dr_n_solv'])}/{args.n_parallel}"
+                )
 
         if tick % args.save_every == 0:
             save_checkpoint(tick, train_steps, runner_state)
