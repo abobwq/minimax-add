@@ -86,9 +86,9 @@ def decode_level(
     """Returns (wall_map, agent_pos, goal_pos, agent_dir) in inner coords."""
     inner = theta[1:14, 1:14]  # (13, 13, 3)
 
-    # Walls: threshold at 0.99. No forced border — minimax handles grid
+    # Walls: threshold at 0.5. No forced border — minimax handles grid
     # boundaries via position clamping, matching the ADD paper and DR generator.
-    wall_map = inner[:, :, 0] > 0.99
+    wall_map = inner[:, :, 0] > 0.5
 
     # Goal: brightest blue pixel in inner region.
     goal_flat = jnp.argmax(inner[:, :, 2].ravel())
